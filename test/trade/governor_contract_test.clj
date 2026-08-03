@@ -59,7 +59,7 @@
     (testing "the seller's order is admitted only after a human approves"
       (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-1"
                                  :interval-id "iv-1" :order-id "o-1" :side :sell
-                                 :qty-wh 2000 :price-minor ask})]
+                                 :qty-wh 2000 :price-minor ask :currency "JPY"})]
         (is (= :escalate (disp r)) "actuation ALWAYS escalates")
         (is (empty? (store/order-log db "iv-1")) "nothing is written before approval"))
       (approve! actor "t1")
@@ -68,7 +68,7 @@
     (testing "the buyer crosses and the book fills at the MAKER's price"
       (run-approved! actor "t2" {:op :actuation/place-order :subject "p-2"
                                  :interval-id "iv-1" :order-id "o-2" :side :buy
-                                 :qty-wh 2000 :price-minor bid})
+                                 :qty-wh 2000 :price-minor bid :currency "JPY"})
       (let [{:keys [fills]} (matching/replay-book (store/order-log db "iv-1"))]
         (is (= 1 (count fills)))
         (is (= ask (:price-minor (first fills))) "buyer bid 26 JPY/kWh, pays 25")
@@ -110,7 +110,7 @@
           actor (op/build db)
           r (exec! actor "t1" {:op :actuation/place-order :subject "p-3"
                                :interval-id "iv-1" :order-id "o-1" :side :sell
-                               :qty-wh 1000 :price-minor ask})]
+                               :qty-wh 1000 :price-minor ask :currency "JPY"})]
       (is (= :hold (disp r)))
       (is (contains? (last-hold-basis db) :unlicensed-sell))
       (is (empty? (store/order-log db "iv-1"))))))
@@ -122,7 +122,7 @@
       (run-approved! actor "lic" {:op :license/verify :subject "p-2"})
       (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-2"
                                  :interval-id "iv-1" :order-id "o-1" :side :buy
-                                 :qty-wh 1000 :price-minor bid})]
+                                 :qty-wh 1000 :price-minor bid :currency "JPY"})]
         (is (= :escalate (disp r)) "escalates for approval, not held")))))
 
 (deftest offering-more-than-you-can-physically-generate-is-a-hard-hold
@@ -133,13 +133,13 @@
       (is (= 50 (registry/deliverable-wh 100 30)))
       (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-5"
                                  :interval-id "iv-1" :order-id "o-1" :side :sell
-                                 :qty-wh 2000 :price-minor ask})]
+                                 :qty-wh 2000 :price-minor ask :currency "JPY"})]
         (is (= :hold (disp r)))
         (is (contains? (last-hold-basis db) :capacity-exceeded))))
     (testing "but a quantity within the physical bound is allowed through to a human"
       (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-5"
                                  :interval-id "iv-1" :order-id "o-2" :side :sell
-                                 :qty-wh 50 :price-minor ask})]
+                                 :qty-wh 50 :price-minor ask :currency "JPY"})]
         (is (= :escalate (disp r)))))))
 
 (deftest capacity-check-counts-the-existing-position
@@ -147,10 +147,10 @@
     (let [[db actor] (fixture)]
       (run-approved! actor "t1" {:op :actuation/place-order :subject "p-1"
                                  :interval-id "iv-1" :order-id "o-1" :side :sell
-                                 :qty-wh 3000 :price-minor ask})
+                                 :qty-wh 3000 :price-minor ask :currency "JPY"})
       (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-1"
                                  :interval-id "iv-1" :order-id "o-2" :side :sell
-                                 :qty-wh 1 :price-minor ask})]
+                                 :qty-wh 1 :price-minor ask :currency "JPY"})]
         (is (= :hold (disp r)) "6000 W * 30 min = 3000 Wh is already committed")
         (is (contains? (last-hold-basis db) :capacity-exceeded))))))
 
@@ -158,10 +158,10 @@
   (let [[db actor] (fixture)]
     (run-approved! actor "t1" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-1" :order-id "o-1" :side :sell
-                               :qty-wh 1000 :price-minor ask})
+                               :qty-wh 1000 :price-minor ask :currency "JPY"})
     (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-1" :order-id "o-2" :side :buy
-                               :qty-wh 1000 :price-minor bid})]
+                               :qty-wh 1000 :price-minor bid :currency "JPY"})]
       (is (= :hold (disp r)))
       (is (contains? (last-hold-basis db) :engine-rejected)
           "wash trading dies at the engine, not at a policy the governor could be argued out of"))))
@@ -172,7 +172,7 @@
         "iv-2 is seeded closed, as an EVENT in its log")
     (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-2" :order-id "o-1" :side :sell
-                               :qty-wh 100 :price-minor ask})]
+                               :qty-wh 100 :price-minor ask :currency "JPY"})]
       (is (= :hold (disp r)))
       (is (contains? (last-hold-basis db) :engine-rejected)))))
 
@@ -180,10 +180,10 @@
   (let [[db actor] (fixture)]
     (run-approved! actor "t1" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-1" :order-id "o-1" :side :sell
-                               :qty-wh 1000 :price-minor ask})
+                               :qty-wh 1000 :price-minor ask :currency "JPY"})
     (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-1" :order-id "o-1" :side :sell
-                               :qty-wh 500 :price-minor ask})]
+                               :qty-wh 500 :price-minor ask :currency "JPY"})]
       (is (= :hold (disp r)))
       (is (contains? (last-hold-basis db) :engine-rejected)))))
 
@@ -200,10 +200,10 @@
   (let [[db actor] (fixture)]
     (run-approved! actor "t1" {:op :actuation/place-order :subject "p-1"
                                :interval-id "iv-1" :order-id "o-1" :side :sell
-                               :qty-wh 2000 :price-minor ask})
+                               :qty-wh 2000 :price-minor ask :currency "JPY"})
     (run-approved! actor "t2" {:op :actuation/place-order :subject "p-2"
                                :interval-id "iv-1" :order-id "o-2" :side :buy
-                               :qty-wh 2000 :price-minor bid})
+                               :qty-wh 2000 :price-minor bid :currency "JPY"})
     (testing "only ONE of the two counterparties submits a reading"
       (run-approved! actor "m1" {:op :meter/submit :subject "iv-1"
                                  :participant-id "p-1" :metered-wh 2000})
@@ -235,7 +235,7 @@
           actor (op/build db)]
       (exec! actor "t1" {:op :actuation/place-order :subject "p-3"
                          :interval-id "iv-1" :order-id "o-1" :side :sell
-                         :qty-wh 1000 :price-minor ask})
+                         :qty-wh 1000 :price-minor ask :currency "JPY"})
       (approve! actor "t1")
       (is (empty? (store/order-log db "iv-1")))
       (is (empty? (store/order-history db))))))
@@ -244,7 +244,7 @@
   (let [[db actor] (fixture)]
     (exec! actor "t1" {:op :actuation/place-order :subject "p-1"
                        :interval-id "iv-1" :order-id "o-1" :side :sell
-                       :qty-wh 1000 :price-minor ask})
+                       :qty-wh 1000 :price-minor ask :currency "JPY"})
     (g/run* actor {:approval {:status :rejected :by "op-1"}}
             {:thread-id "t1" :resume? true})
     (is (empty? (store/order-log db "iv-1")))
@@ -263,3 +263,115 @@
     (is (false? (:ok? v)))
     (is (true? (:escalate? v)))
     (is (false? (:hard? v)))))
+
+;; ─────────────── global model: currency, cross-border, rights ───────────────
+
+(deftest an-order-in-the-wrong-currency-is-a-hard-hold
+  (testing "without this rule a JPY ask and a EUR bid cross on their bare integers"
+    (let [[db actor] (fixture)
+          r (exec! actor "t1" {:op :actuation/place-order :subject "p-1"
+                               :interval-id "iv-1" :order-id "o-1" :side :sell
+                               :qty-wh 1000 :price-minor ask :currency "EUR"})]
+      (is (= :hold (disp r)))
+      (is (contains? (last-hold-basis db) :currency-mismatch))
+      (is (empty? (store/order-log db "iv-1"))))))
+
+(deftest each-book-is-single-currency
+  (let [db (store/seed-db)]
+    (is (= "JPY" (:currency (store/interval db "iv-1"))))
+    (is (= "EUR" (:currency (store/interval db "iv-eu"))))
+    (testing "the same integer price means a different amount of money in each"
+      (is (not= (:currency (store/interval db "iv-1"))
+                (:currency (store/interval db "iv-eu")))))))
+
+(deftest a-cross-border-match-without-a-declared-basis-is-a-hard-hold
+  (testing "power crosses a border because an interconnector exists, not because two people agreed a price"
+    (let [db (store/seed-db)
+          actor (op/build db)]
+      ;; a Spanish seller rests an ask on the EUR book
+      (run-approved! actor "lic-6" {:op :license/verify :subject "p-6"})
+      (run-approved! actor "scr-6" {:op :conduct/screen :subject "p-6"})
+      (run-approved! actor "t1" {:op :actuation/place-order :subject "p-6"
+                                 :interval-id "iv-eu" :order-id "o-1" :side :sell
+                                 :qty-wh 2000 :price-minor ask :currency "EUR"})
+      (is (= 1 (count (store/order-log db "iv-eu"))))
+      ;; a Japanese buyer tries to cross it -- different jurisdiction, no basis
+      (run-approved! actor "lic-1" {:op :license/verify :subject "p-1"})
+      (run-approved! actor "scr-1" {:op :conduct/screen :subject "p-1"})
+      (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-1"
+                                 :interval-id "iv-eu" :order-id "o-2" :side :buy
+                                 :qty-wh 2000 :price-minor bid :currency "EUR"})]
+        (is (= :hold (disp r)))
+        (is (contains? (last-hold-basis db) :cross-border-without-basis))
+        (is (= 1 (count (store/order-log db "iv-eu"))) "the cross never happened")))))
+
+(deftest a-declared-cross-border-basis-permits-the-match
+  (testing "the rule refuses to INFER a basis; it does not refuse the trade outright"
+    (let [db (store/seed-db)
+          actor (op/build db)]
+      (doseq [pid ["p-6" "p-1"]]
+        (run-approved! actor (str "lic-" pid) {:op :license/verify :subject pid})
+        (run-approved! actor (str "scr-" pid) {:op :conduct/screen :subject pid}))
+      (run-approved! actor "t1" {:op :actuation/place-order :subject "p-6"
+                                 :interval-id "iv-xb" :order-id "o-1" :side :sell
+                                 :qty-wh 2000 :price-minor ask :currency "EUR"})
+      (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-1"
+                                 :interval-id "iv-xb" :order-id "o-2" :side :buy
+                                 :qty-wh 2000 :price-minor bid :currency "EUR"})]
+        (is (= :escalate (disp r)) "reaches a human normally")
+        (approve! actor "t2")
+        (let [{:keys [fills]} (matching/replay-book (store/order-log db "iv-xb"))]
+          (is (= 1 (count fills)))
+          (is (= "p-6" (:seller (first fills))))
+          (is (= "p-1" (:buyer (first fills)))))))))
+
+(deftest same-jurisdiction-matches-need-no-cross-border-basis
+  (let [[db actor] (fixture)]
+    (run-approved! actor "t1" {:op :actuation/place-order :subject "p-1"
+                               :interval-id "iv-1" :order-id "o-1" :side :sell
+                               :qty-wh 1000 :price-minor ask :currency "JPY"})
+    (let [r (exec! actor "t2" {:op :actuation/place-order :subject "p-2"
+                               :interval-id "iv-1" :order-id "o-2" :side :buy
+                               :qty-wh 1000 :price-minor bid :currency "JPY"})]
+      (is (= :escalate (disp r)))
+      (is (not (contains? (last-hold-basis db) :cross-border-without-basis))))))
+
+(deftest a-wholesale-only-right-does-not-authorise-a-peer-to-peer-sale
+  (testing "USA federal grants :sell-wholesale, and this exchange is not a wholesale market"
+    (let [db (store/seed-db)
+          actor (op/build db)]
+      (run-approved! actor "lic" {:op :license/verify :subject "p-8"})
+      (is (= #{:generate :sell-wholesale} (set (:permits (store/licence-of db "p-8"))))
+          "the licence commits successfully -- the right is real, it is just the wrong right")
+      (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-8"
+                                 :interval-id "iv-1" :order-id "o-1" :side :sell
+                                 :qty-wh 1000 :price-minor ask :currency "JPY"})]
+        (is (= :hold (disp r)))
+        (is (contains? (last-hold-basis db) :unlicensed-sell))))))
+
+(deftest a-jurisdiction-that-grants-no-sell-right-holds
+  (testing "KOR: the retail licence exists in law but only the incumbent holds one"
+    (let [db (store/seed-db)
+          actor (op/build db)]
+      (run-approved! actor "lic" {:op :license/verify :subject "p-9"})
+      (is (= #{:generate} (set (:permits (store/licence-of db "p-9")))))
+      (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-9"
+                                 :interval-id "iv-1" :order-id "o-1" :side :sell
+                                 :qty-wh 1000 :price-minor ask :currency "JPY"})]
+        (is (= :hold (disp r)))
+        (is (contains? (last-hold-basis db) :unlicensed-sell))))))
+
+(deftest a-bloc-resolved-participant-can-actually-trade
+  (testing "one verified EU citation is enough for a Spanish co-op with no national entry"
+    (let [db (store/seed-db)
+          actor (op/build db)]
+      (run-approved! actor "lic" {:op :license/verify :subject "p-6"})
+      (let [lic (store/licence-of db "p-6")]
+        (is (= :bloc (:resolved-at lic)))
+        (is (= "EU" (:resolved-key lic)))
+        (is (contains? (set (:permits lic)) :sell)))
+      (run-approved! actor "scr" {:op :conduct/screen :subject "p-6"})
+      (let [r (exec! actor "t1" {:op :actuation/place-order :subject "p-6"
+                                 :interval-id "iv-eu" :order-id "o-1" :side :sell
+                                 :qty-wh 2000 :price-minor ask :currency "EUR"})]
+        (is (= :escalate (disp r)))))))

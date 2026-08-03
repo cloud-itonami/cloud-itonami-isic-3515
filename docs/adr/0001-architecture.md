@@ -170,14 +170,21 @@ gated is gated for a reason a regulator would recognise.
 
 **Costs and limits, stated plainly.**
 
-- **Four jurisdictions**, not 194. Coverage is reported honestly by
-  `trade.facts/coverage`.
-- **No exemption thresholds are encoded**, though every seeded
-  jurisdiction has them. None were verified, and an unverified threshold
-  is a fabrication with a number on it.
-- **USA is wholesale-only.** FERC's market-based rate authority is what
-  was verified; no state retail regime was. A retail peer-to-peer sale
-  inside one US state has no spec-basis here.
+- **Ten national entries plus one bloc**, reaching 36 jurisdictions —
+  not 194. Coverage is reported honestly by `trade.facts/coverage`, in
+  terms of a data gap rather than a scope limit.
+- **Exactly one exemption threshold is encoded** (ZAF's 100 MW), because
+  the instrument that set it was identified by number and date. Every
+  other entry admits its thresholds exist and were not read. An
+  unverified threshold is a fabrication with a number on it.
+- **USA is wholesale-only** and **CAN is federal-only**; both withhold
+  `:sell`. A retail peer-to-peer sale in either has no spec-basis until
+  a subdivision entry is seeded.
+- **KOR rests on secondary sources** (practitioner guides, not the
+  Electricity Business Act itself), which its `:verification-note` says.
+  It is seeded anyway because the finding is conservative — it withholds
+  a right rather than granting one — and because omitting Korea would
+  misrepresent the world as uniformly liberalised.
 - **Nameplate capacity is an upper bound, not a forecast.** A solar
   generator at night can deliver far less than the bound allows. The bound
   refuses only the physically impossible; it is the floor of market
@@ -192,9 +199,81 @@ gated is gated for a reason a regulator would recognise.
 - **The matching engine is duplicated** with `isic-6611-cryptoexchange`.
   Accepted deliberately (D3); revisit if a shared library is extracted.
 
+## Amendment, 2026-08-03 — worldwide coverage (D9–D12)
+
+The first iteration seeded four jurisdictions and, more importantly,
+carried two assumptions that only a single-country catalog can hide.
+Superproject ADR-2608030900 records the expansion; the decisions are
+summarised here because they change this repository's own architecture.
+
+### D9. Three resolution levels, walked in order
+
+`resolve-basis` walks **subdivision (ISO 3166-2) → national (ISO 3166-1
+alpha-3) → bloc**, and reports which level answered in `:resolved-at`.
+Subdivision is not an edge case: electricity retail is a subnational
+competence in the United States, Canada, Australia and India. The bloc
+level lets one verified EU citation carry 26 member states that have no
+national entry.
+
+Fallback must never invent a right the fallback level lacks. A Vermont
+participant resolves to the USA federal entry and still cannot make a
+retail sale, because that entry does not carry `:sell`.
+
+### D10. Named rights, and `:sell-wholesale` ≠ `:sell`
+
+`:permits` gained `:sell-wholesale`. FERC's market-based rate authority
+is real and worth recording, but it is authority over *wholesale* sales;
+retail is a state competence nobody verified. Collapsing the two into a
+single `:sell` would have made the United States' entry authorise
+exactly the transaction it does not cover — the most consequential
+fabrication available in the file.
+
+Three entries now deliberately withhold `:sell` (USA federal, CAN
+federal, KOR). Korea is the load-bearing one: the retail licence exists
+in law and has never been granted to anyone but the incumbent. **A
+catalog that could only describe liberalised markets would be assuming
+its own conclusion**, so the model has to be able to say "not here".
+
+### D11. Currency, because bare integers have no unit
+
+A book is denominated in exactly one ISO 4217 currency, carried by the
+delivery interval, and an order in another currency is HARD-held.
+
+This was a real defect, not a missing feature. Prices are bare integers
+— which is precisely what makes the money arithmetic exact (D4) and what
+makes the unit un-inferable. A JPY ask and a EUR bid would have crossed
+on their integers and produced a fill roughly two orders of magnitude
+wrong, silently, with a correct-looking audit trail. `register-order`
+now also refuses to build a record without the currency recorded
+alongside the price: a bare number is unauditable in the dispute the
+record exists for.
+
+No FX, and none intended. Cross-currency trade is a different product
+with different risk.
+
+### D12. Cross-border matches must be declared, not inferred
+
+If an order would match against a resting order held in a different
+jurisdiction, the interval must carry an explicit `:cross-border-basis`.
+Checked at placement rather than at fill, because by the time the engine
+has produced a fill the obligation already exists.
+
+Power crosses a border because an interconnector exists and capacity was
+allocated, not because two people agreed a price. This actor cannot
+verify any of that, so it refuses to *imply* it. The rule does not
+forbid the trade — a declared basis permits it.
+
+### What did not change
+
+The engine, the log-as-only-market-state discipline, the integer money
+arithmetic, the two permanently-non-auto actuations, and the
+advisor-never-picks-a-price rule are all untouched. Going worldwide
+added dimensions to the *facts* and two boundary checks to the
+*governor*; it did not require relaxing a single invariant.
+
 ## Verification
 
-`clojure -M:dev:test` — 57 tests, **368 assertions, 0 failures, 0
+`clojure -M:dev:test` — 73 tests, **568 assertions, 0 failures, 0
 errors**. `clojure -M:lint` — **0 errors, 0 warnings**.
 `clojure -M:dev:run` walks a complete trade (2000 Wh at the maker's
 25 JPY/kWh = 50.00 JPY exactly, seller 50 Wh short at the meter) and then

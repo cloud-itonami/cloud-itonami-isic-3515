@@ -11,12 +11,13 @@
   *reject* a proposal and fall back to HOLD -- the electricity-trade
   analog of `cloud-itonami-isic-3512`'s Grid Policy Governor.
 
-  Seven checks, in priority order, ALL HARD violations: a human approver
+  Nine checks, in priority order, ALL HARD violations: a human approver
   CANNOT override them. You do not get to approve your way past a
-  fabricated market spec-basis, an unlicensed sale, a seller offering
-  more power than it could physically generate, an order the matching
-  engine itself refuses, an unresolved market-abuse flag, a settlement
-  over unmetered delivery, or a double settlement.
+  fabricated market spec-basis, an unlicensed sale, an order priced in
+  the wrong currency, a cross-border match with no stated basis, a
+  seller offering more power than it could physically generate, an
+  order the matching engine itself refuses, an unresolved market-abuse
+  flag, a settlement over unmetered delivery, or a double settlement.
 
   The confidence/actuation gate is SOFT: it asks a human to look (low
   confidence / actuation), and the human may approve -- but see
@@ -34,7 +35,22 @@
                                 the `:sell` right? Anyone may register
                                 and anyone may generate; selling is what
                                 the jurisdiction gates, and this is
-                                where that gate lives.
+                                where that gate lives. `:sell-wholesale`
+                                does NOT satisfy it.
+    3b. Currency mismatch    -- is the order denominated in the same
+                                currency as its interval's book? Prices
+                                are bare integers, which is what makes
+                                the arithmetic exact and what makes the
+                                unit un-inferable, so it is enforced at
+                                the boundary. Without this a JPY ask and
+                                a USD bid cross on their integers.
+    3c. Cross-border         -- would this order match against a resting
+                                order held in a DIFFERENT jurisdiction
+                                without the interval declaring a
+                                `:cross-border-basis`? Power crosses a
+                                border because an interconnector exists
+                                and capacity was allocated, not because
+                                two people agreed a price.
     4. Capacity exceeded     -- for a SELL order, INDEPENDENTLY recompute
                                 from the participant's own registered
                                 nameplate capacity and the interval's own
@@ -137,8 +153,12 @@
                         (let [p (store/participant st pid)
                               lic (store/licence-of st pid)]
                           (and lic
+                               ;; the whole participant map, so the
+                               ;; subdivision -> national -> bloc walk
+                               ;; resolves at the same level the licence
+                               ;; was verified at
                                (facts/required-evidence-satisfied?
-                                (:jurisdiction p) (:checklist lic)))))
+                                p (:checklist lic)))))
                       ids)]
       (when (seq bad)
         [{:rule :evidence-incomplete
@@ -153,14 +173,98 @@
   the jurisdiction's own line between notifying that you generate and
   being authorised to sell is enforced here rather than wished away.
   The right is read from the COMMITTED verification (`:permits`), never
-  from the proposal -- an advisor cannot license itself."
+  from the proposal -- an advisor cannot license itself.
+
+  `:sell` and `:sell-wholesale` are DIFFERENT rights and neither implies
+  the other. This exchange performs a peer-to-peer sale to another
+  participant, so `:sell` is what it requires. A participant resolving
+  to a jurisdiction that grants only `:sell-wholesale` (the United
+  States' federal entry) or nothing at all (KOR, CAN federal) is held
+  here -- correctly, and with a detail that names which right was
+  actually on file rather than just saying no."
   [{:keys [op subject]} proposal st]
   (when (and (= op :actuation/place-order)
              (= :sell (get-in proposal [:value :side])))
-    (let [lic (store/licence-of st subject)]
-      (when-not (contains? (set (:permits lic)) :sell)
+    (let [lic (store/licence-of st subject)
+          held (set (:permits lic))]
+      (when-not (contains? held :sell)
         [{:rule :unlicensed-sell
-          :detail (str subject " は売却権限(:sell)を持つ確定済みライセンス基盤を持たない")}]))))
+          :detail (str subject " は売却権限(:sell)を持つ確定済みライセンス基盤を持たない"
+                       " (保有権限: " (pr-str (vec (sort held)))
+                       (when-let [k (:resolved-key lic)]
+                         (str " / 解決レベル " (:resolved-at lic) "=" k))
+                       ")")}]))))
+
+(defn- currency-mismatch-violations
+  "An order must be denominated in the SAME currency as its delivery
+  interval's book.
+
+  Without this rule a JPY ask and a USD bid cross on their bare
+  integers and produce a fill roughly two orders of magnitude wrong,
+  silently. Prices in this actor are integers with no unit attached to
+  them, which is exactly what makes the integer arithmetic exact -- and
+  exactly why the unit has to be enforced at the boundary instead.
+
+  A book is single-currency by construction; there is no FX in this
+  actor and no intention to add one. Cross-currency trade is a
+  different product with different risk, and pretending an order book
+  can do it by coincidence of integer comparison is how a market
+  produces a fill nobody can explain."
+  [{:keys [op]} proposal st]
+  (when (= op :actuation/place-order)
+    (let [iv (store/interval st (get-in proposal [:value :interval-id]))
+          order-ccy (get-in proposal [:value :currency])
+          book-ccy (:currency iv)]
+      (cond
+        (not (facts/iso4217? book-ccy))
+        [{:rule :interval-currency-missing
+          :detail (str (:id iv) " に有効な通貨(ISO 4217)が設定されていない")}]
+
+        (not= order-ccy book-ccy)
+        [{:rule :currency-mismatch
+          :detail (str "注文通貨 " (pr-str order-ccy) " が板の通貨 "
+                       (pr-str book-ccy) " と一致しない -- 板は単一通貨建て")}]))))
+
+(defn- cross-border-violations
+  "If this order would cross with a resting order held by a participant
+  in a DIFFERENT jurisdiction, the interval must carry an explicit
+  `:cross-border-basis`, and BOTH sides must hold the `:sell`/purchase
+  rights their own jurisdiction grants.
+
+  Electricity does not cross a border because two people agreed on a
+  price. It crosses because an interconnector exists, capacity was
+  allocated, and both regulators recognise the transaction. This actor
+  cannot verify any of that, so it refuses to IMPLY it: absent a stated
+  basis, a match across jurisdictions is held.
+
+  The check runs at placement rather than at fill, because by the time
+  the engine has produced a fill the obligation already exists. It uses
+  the replayed crossing region -- the same public log everyone else
+  reads."
+  [{:keys [op subject]} proposal st]
+  (when (= op :actuation/place-order)
+    (let [iv-id (get-in proposal [:value :interval-id])
+          iv (store/interval st iv-id)
+          {:keys [book]} (replayed st iv-id)
+          side (get-in proposal [:value :side])
+          price (get-in proposal [:value :price-minor])
+          mine (:jurisdiction (store/participant st subject))
+          opposite (if (= side :buy) (:asks book) (:bids book))
+          reachable (take-while (fn [o]
+                                  (if (= side :buy)
+                                    (<= (:price-minor o) (or price 0))
+                                    (<= (or price 0) (:price-minor o))))
+                                opposite)
+          foreign (->> reachable
+                       (map #(:jurisdiction (store/participant st (:account %))))
+                       (remove #(= % mine))
+                       distinct
+                       vec)]
+      (when (and (seq foreign) (not (:cross-border-basis iv)))
+        [{:rule :cross-border-without-basis
+          :detail (str "法域 " mine " の注文が " (pr-str foreign)
+                       " の板上注文と約定しうるが、" iv-id
+                       " に cross-border-basis が宣言されていない")}]))))
 
 (defn- capacity-exceeded-violations
   "For a SELL order, INDEPENDENTLY recompute whether the participant's
@@ -275,6 +379,8 @@
                    (concat (spec-basis-violations request proposal)
                            (evidence-incomplete-violations request st)
                            (unlicensed-sell-violations request proposal st)
+                           (currency-mismatch-violations request proposal st)
+                           (cross-border-violations request proposal st)
                            (capacity-exceeded-violations request proposal st)
                            (engine-rejection-violations request proposal st)
                            (market-abuse-flag-unresolved-violations request proposal st)

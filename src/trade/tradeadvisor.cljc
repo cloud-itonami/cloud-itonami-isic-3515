@@ -83,19 +83,22 @@
   is 'may not sell', never 'may sell'."
   [db {:keys [subject no-spec?]}]
   (let [p (store/participant db subject)
-        iso3 (if no-spec? "ATL" (:jurisdiction p))
-        sb (facts/spec-basis iso3)]
+        target (if no-spec? {:jurisdiction "ATL"} p)
+        iso3 (:jurisdiction target)
+        sb (facts/resolve-basis target)]
     (if (nil? sb)
       {:summary    (str iso3 " の公式spec-basisが見つかりません")
        :rationale  "trade.facts に未登録の法域。市場参加要件を推測で作らない。"
        :cites      []
        :effect     :licence/set
-       :value      {:jurisdiction iso3 :checklist [] :permits #{} :spec-basis nil}
+       :value      {:jurisdiction iso3 :subdivision (:subdivision target)
+                    :checklist [] :permits #{} :spec-basis nil}
        :stake      nil
        :confidence 0.9}
       {:summary    (str iso3 " (" (:owner-authority sb) ") 向け必要書類 "
                         (count (:required-evidence sb)) " 件を提案 / 付与権限 "
-                        (pr-str (sort (:permits sb))))
+                        (pr-str (sort (:permits sb)))
+                        " [解決レベル " (name (:resolved-at sb)) "=" (:resolved-key sb) "]")
        :rationale  (str "公式ソース: " (:provenance sb)
                         " / 法的根拠: " (:legal-basis sb)
                         " / 発電: " (:generate-basis sb)
@@ -103,8 +106,11 @@
        :cites      [(:legal-basis sb) (:provenance sb)]
        :effect     :licence/set
        :value      {:jurisdiction iso3
+                    :subdivision (:subdivision target)
                     :checklist (:required-evidence sb)
                     :permits (:permits sb)
+                    :resolved-at (:resolved-at sb)
+                    :resolved-key (:resolved-key sb)
                     :spec-basis (:provenance sb)
                     :legal-basis (:legal-basis sb)}
        :stake      nil
@@ -171,7 +177,7 @@
   That is a courtesy signal for the human approver, NOT the enforcement
   path: `trade.governor` recomputes both independently and holds HARD,
   so a mock or an LLM reporting 0.99 here changes nothing."
-  [db {:keys [subject interval-id order-id side qty-wh price-minor]}]
+  [db {:keys [subject interval-id order-id side qty-wh price-minor currency]}]
   (let [p (store/participant db subject)
         iv (store/interval db interval-id)
         lic (store/licence-of db subject)
@@ -182,7 +188,8 @@
         over? (and sell? (registry/capacity-exceeded?
                           p (:duration-minutes iv) already qty-wh))]
     {:summary    (str subject " の " (name (or side :?)) " 注文提案: "
-                      qty-wh "Wh @ " price-minor "µ/Wh (" interval-id ")")
+                      qty-wh "Wh @ " price-minor "µ" (or currency "???")
+                      "/Wh (" interval-id ")")
      :rationale  (if p
                    (str "role=" (:role p)
                         " capacity-w=" (:capacity-w p)
@@ -190,6 +197,8 @@
                         " deliverable-wh=" (registry/deliverable-wh
                                             (:capacity-w p) (:duration-minutes iv))
                         " already-contracted-wh=" already
+                        " order-currency=" (pr-str currency)
+                        " book-currency=" (pr-str (:currency iv))
                         " permits=" (pr-str (sort (or (:permits lic) []))))
                    "参加者記録が見つかりません")
      :cites      (if p [subject interval-id] [])
@@ -199,10 +208,12 @@
                   :order-id order-id
                   :side side
                   :qty-wh qty-wh
-                  :price-minor price-minor}
+                  :price-minor price-minor
+                  :currency currency}
      :stake      :actuation/place-order
      :confidence (cond (nil? p) 0.2
                        (and sell? (not licensed?)) 0.3
+                       (not= currency (:currency iv)) 0.2
                        over? 0.3
                        :else 0.9)}))
 

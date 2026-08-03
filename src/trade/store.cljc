@@ -77,18 +77,32 @@
 ;; ----------------------------- demo data -----------------------------
 
 (defn demo-data
-  "A small, self-contained participant/interval set covering the whole
-  failure surface (unknown jurisdiction, unresolved market-abuse flag,
-  a seller too small to deliver what it offers, a closed gate) so the
-  actor + tests run offline."
+  "A self-contained, DELIBERATELY MULTI-CONTINENTAL participant/interval
+  set. It covers the whole failure surface offline: an unresolvable
+  jurisdiction, an unresolved market-abuse flag, a seller too small to
+  deliver what it offers, a closed gate, a currency mismatch, a
+  cross-border match with no basis, and -- the two that only appear once
+  the catalog stops being one country -- a participant whose
+  jurisdiction grants `:sell-wholesale` but not `:sell` (USA federal),
+  and one whose jurisdiction grants neither (KOR).
+
+  The demo is not Japanese with foreign extras bolted on. Japan, the EU
+  (via Spain, which has no national entry of its own and resolves to the
+  bloc), the United States, India and Korea each carry a distinct
+  regulatory shape, because a demo that only exercised one country would
+  have let the single-currency and single-jurisdiction assumptions
+  survive unnoticed -- which is exactly how they survived the first
+  iteration of this actor."
   []
   {:participants
-   {"p-1" {:id "p-1" :display-name "鈴木家 屋根置き太陽光+蓄電池"
+   {;; JPN -- full rights, the happy path
+    "p-1" {:id "p-1" :display-name "鈴木家 屋根置き太陽光+蓄電池"
            :role :prosumer :jurisdiction "JPN" :capacity-w 6000
            :market-abuse-flag-unresolved? false :status :intake}
     "p-2" {:id "p-2" :display-name "さくら保育園"
            :role :consumer :jurisdiction "JPN" :capacity-w 0
            :market-abuse-flag-unresolved? false :status :intake}
+    ;; no entry at any level -> no spec-basis
     "p-3" {:id "p-3" :display-name "Atlantis Off-Grid Co-op"
            :role :prosumer :jurisdiction "ATL" :capacity-w 4000
            :market-abuse-flag-unresolved? false :status :intake}
@@ -97,20 +111,56 @@
            :market-abuse-flag-unresolved? true :status :intake}
     "p-5" {:id "p-5" :display-name "ベランダ発電 100W"
            :role :generator :jurisdiction "JPN" :capacity-w 100
-           :market-abuse-flag-unresolved? false :status :intake}}
+           :market-abuse-flag-unresolved? false :status :intake}
+    ;; ESP has no national entry -- resolves to the EU bloc, whose basis
+    ;; is Dir. (EU) 2018/2001 Art. 21(2)(a), which names peer-to-peer
+    ;; trading explicitly.
+    "p-6" {:id "p-6" :display-name "Cooperativa Solar de Sevilla"
+           :role :prosumer :jurisdiction "ESP" :capacity-w 12000
+           :market-abuse-flag-unresolved? false :status :intake}
+    "p-7" {:id "p-7" :display-name "Escuela Pública de Sevilla"
+           :role :consumer :jurisdiction "ESP" :capacity-w 0
+           :market-abuse-flag-unresolved? false :status :intake}
+    ;; USA federal grants :sell-wholesale but NOT :sell -- a retail P2P
+    ;; sale is held until a "USA-<state>" entry exists.
+    "p-8" {:id "p-8" :display-name "Vermont Farm Solar LLC"
+           :role :prosumer :jurisdiction "USA" :subdivision "VT" :capacity-w 20000
+           :market-abuse-flag-unresolved? false :status :intake}
+    ;; KOR grants :generate only -- the retail licence has never been
+    ;; granted to anyone but the incumbent.
+    "p-9" {:id "p-9" :display-name "제주 태양광 협동조합"
+           :role :prosumer :jurisdiction "KOR" :capacity-w 15000
+           :market-abuse-flag-unresolved? false :status :intake}
+    ;; IND -- generation de-licensed outright, trading licensed
+    "p-10" {:id "p-10" :display-name "Bengaluru Rooftop Collective"
+            :role :prosumer :jurisdiction "IND" :capacity-w 9000
+            :market-abuse-flag-unresolved? false :status :intake}}
 
    :intervals
    {"iv-1" {:id "iv-1" :starts-at-iso "2026-08-04T09:00:00Z"
-            :duration-minutes 30 :jurisdiction "JPN"
+            :duration-minutes 30 :jurisdiction "JPN" :currency "JPY"
             :settled? false :settlement-number nil}
     "iv-2" {:id "iv-2" :starts-at-iso "2026-08-04T09:30:00Z"
-            :duration-minutes 30 :jurisdiction "JPN"
-            :settled? false :settlement-number nil}}
+            :duration-minutes 30 :jurisdiction "JPN" :currency "JPY"
+            :settled? false :settlement-number nil}
+    ;; a EUR book -- proves a second currency exists and that the two
+    ;; cannot be confused for one another
+    "iv-eu" {:id "iv-eu" :starts-at-iso "2026-08-04T09:00:00Z"
+             :duration-minutes 30 :jurisdiction "ESP" :currency "EUR"
+             :settled? false :settlement-number nil}
+    ;; an interval with a stated cross-border basis, so a match between
+    ;; two different jurisdictions is permitted rather than held
+    "iv-xb" {:id "iv-xb" :starts-at-iso "2026-08-04T09:00:00Z"
+             :duration-minutes 30 :jurisdiction "ESP" :currency "EUR"
+             :cross-border-basis "DEMO: interconnector capacity allocated; both NRAs recognise the transaction. Not a real allocation -- this field exists so that a cross-border match must be DECLARED rather than inferred."
+             :settled? false :settlement-number nil}}
 
    ;; iv-2's gate is already closed -- seeded as the EVENT that closes
    ;; it, because the log is the only source of gate state.
    :order-logs {"iv-1" []
-                "iv-2" [{:kind :close-gate :seq 1}]}})
+                "iv-2" [{:kind :close-gate :seq 1}]
+                "iv-eu" []
+                "iv-xb" []}})
 
 ;; ------------------------- shared commit logic -------------------------
 
@@ -132,9 +182,10 @@
                :side side
                :price-minor price-minor
                :qty-minor qty-wh}
+        iv (interval s interval-id)
         seq-n (next-order-sequence s (:jurisdiction p))
         result (registry/register-order participant-id interval-id (:jurisdiction p)
-                                        side qty-wh price-minor seq-n)]
+                                        (:currency iv) side qty-wh price-minor seq-n)]
     {:event event :result result}))
 
 (defn- interval-positions
@@ -274,12 +325,13 @@
     :order-sequence/jurisdiction :settlement-sequence/jurisdiction]))
 
 (defn- participant->tx
-  [{:keys [id display-name role jurisdiction capacity-w
+  [{:keys [id display-name role jurisdiction subdivision capacity-w
            market-abuse-flag-unresolved? status]}]
   (cond-> {:participant/id id}
     display-name (assoc :participant/display-name display-name)
     role (assoc :participant/role role)
     jurisdiction (assoc :participant/jurisdiction jurisdiction)
+    subdivision (assoc :participant/subdivision subdivision)
     (some? capacity-w) (assoc :participant/capacity-w capacity-w)
     (some? market-abuse-flag-unresolved?)
     (assoc :participant/market-abuse-flag-unresolved? market-abuse-flag-unresolved?)
@@ -287,40 +339,49 @@
 
 (def ^:private participant-pull
   [:participant/id :participant/display-name :participant/role
-   :participant/jurisdiction :participant/capacity-w
+   :participant/jurisdiction :participant/subdivision :participant/capacity-w
    :participant/market-abuse-flag-unresolved? :participant/status])
 
 (defn- pull->participant [m]
   (when (:participant/id m)
-    {:id (:participant/id m)
+    (cond-> {:id (:participant/id m)
      :display-name (:participant/display-name m)
      :role (:participant/role m)
      :jurisdiction (:participant/jurisdiction m)
      :capacity-w (:participant/capacity-w m)
      :market-abuse-flag-unresolved? (boolean (:participant/market-abuse-flag-unresolved? m))
-     :status (:participant/status m)}))
+     :status (:participant/status m)}
+      (:participant/subdivision m)
+      (assoc :subdivision (:participant/subdivision m)))))
 
 (defn- interval->tx
-  [{:keys [id starts-at-iso duration-minutes jurisdiction settled? settlement-number]}]
+  [{:keys [id starts-at-iso duration-minutes jurisdiction currency
+           cross-border-basis settled? settlement-number]}]
   (cond-> {:interval/id id}
     starts-at-iso (assoc :interval/starts-at-iso starts-at-iso)
     (some? duration-minutes) (assoc :interval/duration-minutes duration-minutes)
     jurisdiction (assoc :interval/jurisdiction jurisdiction)
+    currency (assoc :interval/currency currency)
+    cross-border-basis (assoc :interval/cross-border-basis cross-border-basis)
     (some? settled?) (assoc :interval/settled? settled?)
     settlement-number (assoc :interval/settlement-number settlement-number)))
 
 (def ^:private interval-pull
   [:interval/id :interval/starts-at-iso :interval/duration-minutes
-   :interval/jurisdiction :interval/settled? :interval/settlement-number])
+   :interval/jurisdiction :interval/currency :interval/cross-border-basis
+   :interval/settled? :interval/settlement-number])
 
 (defn- pull->interval [m]
   (when (:interval/id m)
-    {:id (:interval/id m)
-     :starts-at-iso (:interval/starts-at-iso m)
-     :duration-minutes (:interval/duration-minutes m)
-     :jurisdiction (:interval/jurisdiction m)
-     :settled? (boolean (:interval/settled? m))
-     :settlement-number (:interval/settlement-number m)}))
+    (cond-> {:id (:interval/id m)
+             :starts-at-iso (:interval/starts-at-iso m)
+             :duration-minutes (:interval/duration-minutes m)
+             :jurisdiction (:interval/jurisdiction m)
+             :currency (:interval/currency m)
+             :settled? (boolean (:interval/settled? m))
+             :settlement-number (:interval/settlement-number m)}
+      (:interval/cross-border-basis m)
+      (assoc :cross-border-basis (:interval/cross-border-basis m)))))
 
 (defrecord DatomicStore [conn]
   Store

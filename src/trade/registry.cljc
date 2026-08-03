@@ -143,13 +143,19 @@
   log, re-derives the book, re-checks that the matching engine accepts
   this order, and re-checks the seller's physical capacity, before this
   is ever allowed to commit."
-  [participant-id interval-id jurisdiction side qty-wh price-minor sequence]
+  [participant-id interval-id jurisdiction currency side qty-wh price-minor sequence]
   (when-not (and participant-id (not= participant-id ""))
     (throw (ex-info "order: participant_id required" {})))
   (when-not (and interval-id (not= interval-id ""))
     (throw (ex-info "order: interval_id required" {})))
   (when-not (and jurisdiction (not= jurisdiction ""))
     (throw (ex-info "order: jurisdiction required" {})))
+  ;; A price is a bare integer; without the currency recorded ALONGSIDE
+  ;; it the record is unreadable six months later and unauditable in a
+  ;; dispute. Refuse to build one rather than emit an ambiguous number.
+  (when-not (and (string? currency) (re-matches #"[A-Z]{3}" currency))
+    (throw (ex-info "order: currency must be an ISO 4217 alpha-3 code"
+                    {:currency currency})))
   (when-not (contains? #{:buy :sell} side)
     (throw (ex-info "order: side must be :buy or :sell" {:side side})))
   (when-not (and (integer? qty-wh) (pos? qty-wh))
@@ -164,6 +170,7 @@
                 "participant_id" participant-id
                 "interval_id" interval-id
                 "jurisdiction" jurisdiction
+                "currency" currency
                 "side" (name side)
                 "qty_wh" qty-wh
                 "price_micro_per_wh" price-minor

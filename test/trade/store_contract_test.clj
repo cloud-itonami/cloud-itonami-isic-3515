@@ -25,14 +25,27 @@
       (is (= 100 (:capacity-w (store/participant s "p-5"))))
       (is (false? (:market-abuse-flag-unresolved? (store/participant s "p-1"))))
       (is (true? (:market-abuse-flag-unresolved? (store/participant s "p-4"))))
-      (is (= ["p-1" "p-2" "p-3" "p-4" "p-5"] (mapv :id (store/all-participants s))))
+      (is (= ["p-1" "p-10" "p-2" "p-3" "p-4" "p-5" "p-6" "p-7" "p-8" "p-9"]
+             (mapv :id (store/all-participants s))))
+      (testing "the demo set is multi-continental by construction"
+        (is (= #{"JPN" "ATL" "ESP" "USA" "KOR" "IND"}
+               (set (map :jurisdiction (store/all-participants s)))))
+        (is (= "VT" (:subdivision (store/participant s "p-8")))
+            "ISO 3166-2 subdivision round-trips -- federal retail is subnational"))
 
       (is (= 30 (:duration-minutes (store/interval s "iv-1"))))
       (is (= "JPN" (:jurisdiction (store/interval s "iv-1"))))
       (is (false? (:settled? (store/interval s "iv-1"))))
-      (is (= ["iv-1" "iv-2"] (mapv :id (store/all-intervals s))))
+      (is (= ["iv-1" "iv-2" "iv-eu" "iv-xb"] (mapv :id (store/all-intervals s))))
+      (testing "each book is denominated in exactly one currency"
+        (is (= "JPY" (:currency (store/interval s "iv-1"))))
+        (is (= "EUR" (:currency (store/interval s "iv-eu")))))
+      (testing "a cross-border basis must be declared, not inferred"
+        (is (nil? (:cross-border-basis (store/interval s "iv-1"))))
+        (is (some? (:cross-border-basis (store/interval s "iv-xb")))))
 
       (is (= [] (store/order-log s "iv-1")))
+      (is (= [] (store/order-log s "iv-eu")))
       (testing "iv-2's gate closure is seeded as an EVENT, not a flag"
         (is (= [{:kind :close-gate :seq 1}] (store/order-log s "iv-2")))
         (is (true? (:gate-closed? (:book (matching/replay-book (store/order-log s "iv-2")))))))
@@ -76,7 +89,7 @@
       (testing "placing an order appends to the log and advances the sequence"
         (store/commit-record! s {:effect :interval/place-order :path ["iv-1"]
                                  :value {:participant-id "p-1" :interval-id "iv-1"
-                                         :order-id "o-1" :side :sell
+                                         :order-id "o-1" :side :sell :currency "JPY"
                                          :qty-wh 2000 :price-minor 25000}})
         (let [log (store/order-log s "iv-1")]
           (is (= 1 (count log)))
@@ -85,12 +98,14 @@
                  (first log))))
         (is (= "JPN-ORD-000000" (get (first (store/order-history s)) "record_id")))
         (is (= "order-placement-draft" (get (first (store/order-history s)) "kind")))
+        (is (= "JPY" (get (first (store/order-history s)) "currency"))
+            "a bare integer price is unauditable without its currency alongside")
         (is (= 1 (store/next-order-sequence s "JPN"))))
 
       (testing "a second order gets the next interval-scoped :seq, and fills"
         (store/commit-record! s {:effect :interval/place-order :path ["iv-1"]
                                  :value {:participant-id "p-2" :interval-id "iv-1"
-                                         :order-id "o-2" :side :buy
+                                         :order-id "o-2" :side :buy :currency "JPY"
                                          :qty-wh 2000 :price-minor 26000}})
         (let [log (store/order-log s "iv-1")]
           (is (= [1 2] (mapv :seq log)) "log is returned in interval-scoped seq order")
@@ -132,7 +147,7 @@
     (testing label
       (store/commit-record! s {:effect :interval/place-order :path ["iv-1"]
                                :value {:participant-id "p-1" :interval-id "iv-1"
-                                       :order-id "a" :side :sell
+                                       :order-id "a" :side :sell :currency "JPY"
                                        :qty-wh 100 :price-minor 25000}})
       (is (= 1 (count (store/order-log s "iv-1"))))
       (is (= 1 (count (store/order-log s "iv-2")))

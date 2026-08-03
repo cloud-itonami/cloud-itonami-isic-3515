@@ -41,7 +41,7 @@
     (is (nil? (r/imbalance-wh nil 2000)))))
 
 (deftest order-record-validates-its-inputs
-  (let [ok (r/register-order "p-1" "iv-1" "JPN" :sell 2000 25000 0)]
+  (let [ok (r/register-order "p-1" "iv-1" "JPN" "JPY" :sell 2000 25000 0)]
     (is (= "JPN-ORD-000000" (get ok "order_number")))
     (is (= "order-placement-draft" (get-in ok ["record" "kind"])))
     (is (= "sell" (get-in ok ["record" "side"])))
@@ -52,14 +52,17 @@
       (is (false? (get-in ok ["certificate" "issued_by_registry"])))
       (is (= "draft-unsigned" (get-in ok ["certificate" "status"])))))
   (testing "sequence advances the reference"
-    (is (= "JPN-ORD-000007" (get (r/register-order "p-1" "iv-1" "JPN" :buy 10 1 7) "order_number"))))
-  (doseq [[label args] {"blank participant" ["" "iv-1" "JPN" :sell 1 1 0]
-                        "blank interval"    ["p-1" "" "JPN" :sell 1 1 0]
-                        "blank jurisdiction" ["p-1" "iv-1" "" :sell 1 1 0]
-                        "bad side"          ["p-1" "iv-1" "JPN" :sideways 1 1 0]
-                        "zero qty"          ["p-1" "iv-1" "JPN" :sell 0 1 0]
-                        "negative price"    ["p-1" "iv-1" "JPN" :sell 1 -1 0]
-                        "negative sequence" ["p-1" "iv-1" "JPN" :sell 1 1 -1]}]
+    (is (= "JPN-ORD-000007" (get (r/register-order "p-1" "iv-1" "JPN" "JPY" :buy 10 1 7) "order_number"))))
+  (doseq [[label args] {"blank participant"  ["" "iv-1" "JPN" "JPY" :sell 1 1 0]
+                        "blank interval"     ["p-1" "" "JPN" "JPY" :sell 1 1 0]
+                        "blank jurisdiction" ["p-1" "iv-1" "" "JPY" :sell 1 1 0]
+                        "missing currency"   ["p-1" "iv-1" "JPN" nil :sell 1 1 0]
+                        "lowercase currency" ["p-1" "iv-1" "JPN" "jpy" :sell 1 1 0]
+                        "bogus currency"     ["p-1" "iv-1" "JPN" "YEN!" :sell 1 1 0]
+                        "bad side"           ["p-1" "iv-1" "JPN" "JPY" :sideways 1 1 0]
+                        "zero qty"           ["p-1" "iv-1" "JPN" "JPY" :sell 0 1 0]
+                        "negative price"     ["p-1" "iv-1" "JPN" "JPY" :sell 1 -1 0]
+                        "negative sequence"  ["p-1" "iv-1" "JPN" "JPY" :sell 1 1 -1]}]
     (testing label
       (is (thrown? clojure.lang.ExceptionInfo (apply r/register-order args))))))
 
@@ -82,6 +85,6 @@
     (is (= [] (get-in (r/register-settlement "iv-9" "JPN" [] 0) ["record" "positions"])))))
 
 (deftest append-collects-records
-  (let [a (r/register-order "p-1" "iv-1" "JPN" :sell 1 1 0)
-        b (r/register-order "p-1" "iv-1" "JPN" :sell 1 1 1)]
+  (let [a (r/register-order "p-1" "iv-1" "JPN" "JPY" :sell 1 1 0)
+        b (r/register-order "p-1" "iv-1" "JPN" "JPY" :sell 1 1 1)]
     (is (= 2 (count (-> [] (r/append a) (r/append b)))))))

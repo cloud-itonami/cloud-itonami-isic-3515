@@ -1,57 +1,180 @@
 (ns trade.facts-test
+  "The catalog's own invariants. The load-bearing ones are not about how
+  MANY jurisdictions are seeded -- they are about the catalog never
+  granting a right it cannot cite, and never letting a coverage gap look
+  like a permission."
   (:require [clojure.test :refer [deftest is testing]]
             [trade.facts :as facts]))
 
-(deftest seeded-jurisdictions-carry-a-real-spec-basis
-  (doseq [iso3 (keys facts/catalog)]
-    (testing iso3
-      (let [sb (facts/spec-basis iso3)]
+(defn- national-keys []
+  (set (remove #(re-find #"-" %) (keys facts/catalog))))
+
+;; ------------------------- entry well-formedness -------------------------
+
+(deftest every-entry-carries-a-real-cited-basis
+  (doseq [k (keys facts/catalog)]
+    (testing k
+      (let [sb (get facts/catalog k)]
         (is (seq (:owner-authority sb)))
         (is (seq (:legal-basis sb)))
         (is (seq (:generate-basis sb)) "the GENERATE side must be stated separately")
         (is (seq (:sell-basis sb)) "the SELL side must be stated separately")
         (is (seq (:provenance sb)))
+        (is (re-find #"https?://" (:provenance sb)) "provenance must be a fetchable URL")
         (is (seq (:required-evidence sb)))
-        (is (set? (:permits sb)))))))
+        (is (set? (:permits sb)))
+        (is (keyword? (:region sb)) "every entry is placed on a continent")))))
 
-(deftest unknown-jurisdiction-permits-nothing
+(deftest every-bloc-carries-a-real-cited-basis-and-members
+  (doseq [[k b] facts/blocs]
+    (testing k
+      (is (seq (:legal-basis b)))
+      (is (re-find #"https?://" (:provenance b)))
+      (is (set? (:members b)))
+      (is (seq (:members b)))
+      (is (seq (:transposition-note b))
+          "a bloc entry must say what resolving to it does NOT tell you"))))
+
+(deftest the-catalog-spans-continents
+  (testing "a catalog that only described one region would let region-specific assumptions survive unnoticed"
+    (is (= #{:asia :europe :americas :africa :oceania}
+           (set (keep #(:region (get facts/catalog %)) (national-keys)))))))
+
+;; ------------------------- the deny-by-default floor -------------------------
+
+(deftest unresolvable-jurisdiction-permits-nothing
   (testing "the default is deny, never a permissive fallback"
-    (is (nil? (facts/spec-basis "ATL")))
+    (is (nil? (facts/resolve-basis "ATL")))
     (is (= #{} (facts/permits "ATL")))
     (is (false? (facts/permits? "ATL" :sell)))
     (is (false? (facts/permits? "ATL" :generate)))
-    (is (false? (facts/permits? nil :sell)))))
+    (is (false? (facts/permits? nil :sell)))
+    (is (false? (facts/permits? {} :sell)))
+    (is (nil? (facts/required-evidence-satisfied? "ATL" ["anything"]))
+        "an unknown jurisdiction is never satisfied, whatever is submitted")))
+
+(deftest an-unlisted-right-is-never-granted-by-accident
+  (is (false? (facts/permits? "JPN" :operate-a-nuclear-reactor)))
+  (is (false? (facts/permits? "JPN" :sell-anything-anywhere))))
+
+;; ------------------------- generate vs sell -------------------------
 
 (deftest permits-distinguishes-generating-from-selling
-  (is (true? (facts/permits? "JPN" :generate)))
-  (is (true? (facts/permits? "JPN" :sell)))
-  (is (false? (facts/permits? "JPN" :operate-a-nuclear-reactor))
-      "an unlisted right is never granted by accident"))
+  (testing "every seeded jurisdiction lets someone generate"
+    (doseq [k (national-keys)]
+      (is (facts/permits? k :generate) k)))
+  (testing "but selling is separately gated, and not universal"
+    (is (true? (facts/permits? "JPN" :sell)))
+    (is (true? (facts/permits? "IND" :sell)))
+    (is (true? (facts/permits? "GBR" :sell)))))
+
+(deftest sell-wholesale-does-not-imply-sell
+  (testing "THE distinction that keeps the US entry honest"
+    (is (true? (facts/permits? "USA" :sell-wholesale)))
+    (is (false? (facts/permits? "USA" :sell))
+        "FERC's authority is wholesale; retail is a state competence nobody verified")))
+
+(deftest jurisdictions-that-withhold-the-sell-right-are-named
+  (testing "a catalog that could only describe liberalised markets would assume its own conclusion"
+    (let [withheld (set (facts/jurisdictions-without-sell-right))]
+      (is (contains? withheld "KOR") "retail licence exists but only KEPCO holds one")
+      (is (contains? withheld "USA") "federal entry is wholesale-only")
+      (is (contains? withheld "CAN") "retail is provincial and unverified")
+      (is (not (contains? withheld "JPN"))))))
+
+;; ------------------------- resolution order -------------------------
+
+(deftest resolution-walks-subdivision-then-national-then-bloc
+  (testing "a jurisdiction with its own national entry resolves there"
+    (let [r (facts/resolve-basis "DEU")]
+      (is (= :national (:resolved-at r)))
+      (is (= "DEU" (:resolved-key r)))
+      (is (re-find #"EnWG" (:legal-basis r)))))
+
+  (testing "an EU member with NO national entry resolves to the bloc"
+    (let [r (facts/resolve-basis "ESP")]
+      (is (= :bloc (:resolved-at r)))
+      (is (= "EU" (:resolved-key r)))
+      (is (= "ESP" (:resolved-for r)))
+      (is (facts/permits? "ESP" :sell)
+          "Dir. (EU) 2018/2001 Art. 21(2)(a) names peer-to-peer trading explicitly")
+      (is (nil? (:members r)) "the member list is not leaked into a resolved basis")))
+
+  (testing "a national entry beats the bloc for the same country"
+    (is (= :national (:resolved-at (facts/resolve-basis "DEU"))))
+    (is (contains? (get-in facts/blocs ["EU" :members]) "DEU")
+        "DEU is an EU member AND has its own entry -- the national one wins"))
+
+  (testing "an unknown subdivision falls back to the national entry rather than failing"
+    (let [r (facts/resolve-basis {:jurisdiction "USA" :subdivision "VT"})]
+      (is (= :national (:resolved-at r)))
+      (is (= "USA" (:resolved-key r)))
+      (is (false? (facts/permits? {:jurisdiction "USA" :subdivision "VT"} :sell))
+          "falling back must NOT invent a retail right the fallback level lacks")))
+
+  (testing "a participant map resolves the same as an explicit jurisdiction map"
+    (is (= (facts/resolve-basis "JPN")
+           (facts/resolve-basis {:jurisdiction "JPN"})
+           (facts/resolve-basis {:iso3 "JPN"})))))
+
+;; ------------------------- evidence -------------------------
 
 (deftest evidence-checklist-must-be-fully-satisfied
-  (let [full (facts/evidence-checklist "JPN")]
-    (is (= 4 (count full)))
-    (is (true? (facts/required-evidence-satisfied? "JPN" full)))
-    (is (false? (facts/required-evidence-satisfied? "JPN" (butlast full)))
-        "a partial checklist never satisfies")
-    (is (false? (facts/required-evidence-satisfied? "JPN" [])))
-    (testing "an unknown jurisdiction is never satisfied, whatever is submitted"
-      (is (nil? (facts/required-evidence-satisfied? "ATL" ["anything"]))))))
+  (doseq [k ["JPN" "GBR" "IND" "ESP"]]
+    (testing k
+      (let [full (facts/evidence-checklist k)]
+        (is (seq full))
+        (is (true? (facts/required-evidence-satisfied? k full)))
+        (is (false? (facts/required-evidence-satisfied? k (butlast full)))
+            "a partial checklist never satisfies")
+        (is (false? (facts/required-evidence-satisfied? k [])))))))
+
+;; ------------------------- currency -------------------------
+
+(deftest iso4217-shape-check-accepts-real-codes-and-rejects-junk
+  (doseq [c ["JPY" "USD" "EUR" "INR" "ZAR" "BRL" "AUD" "KRW" "GBP"]]
+    (is (true? (facts/iso4217? c)) c))
+  (doseq [bad [nil "" "jpy" "YEN!" "JP" "JPYY" 392]]
+    (is (false? (facts/iso4217? bad)) (pr-str bad))))
+
+;; ------------------------- honesty -------------------------
 
 (deftest coverage-is-reported-honestly
-  (let [c (facts/coverage ["JPN" "GBR" "ATL" "ZZZ"])]
+  (let [c (facts/coverage ["JPN" "ESP" "ATL" "ZZZ"])]
     (is (= 4 (:requested c)))
     (is (= 2 (:covered c)))
-    (is (= ["GBR" "JPN"] (:covered-jurisdictions c)))
+    (is (= ["JPN"] (:covered-directly c)))
+    (is (= ["ESP"] (:covered-via-bloc c))
+        "bloc-resolved coverage is reported SEPARATELY, never as its own entry")
     (is (= ["ATL" "ZZZ"] (:missing-jurisdictions c))
         "missing jurisdictions are named, never silently dropped"))
-  (testing "the default report covers exactly what is seeded"
-    (is (= (count facts/catalog) (:covered (facts/coverage))))
-    (is (= [] (:missing-jurisdictions (facts/coverage))))))
+  (testing "the default report covers the national entries plus the bloc members"
+    (let [c (facts/coverage)]
+      (is (= [] (:missing-jurisdictions c)))
+      (is (= (:covered c) (:requested c)))
+      (is (> (count (:covered-via-bloc c)) 20)
+          "one verified EU citation carries 27 member states"))))
 
-(deftest scope-limits-are-recorded-not-papered-over
-  (testing "USA's entry states that FERC reaches wholesale, not retail"
-    (is (seq (:jurisdiction-note (facts/spec-basis "USA")))))
-  (testing "every entry declares that exemption thresholds are unverified"
-    (doseq [iso3 (keys facts/catalog)]
-      (is (seq (:exemption-note (facts/spec-basis iso3))) iso3))))
+(deftest thresholds-appear-only-where-the-instrument-was-identified
+  (testing "exactly one numeric threshold is encoded, and it names its instrument"
+    (let [with-threshold (filter #(:exemption-threshold (get facts/catalog %))
+                                 (national-keys))]
+      (is (= ["ZAF"] (vec (sort with-threshold))))
+      (let [t (:exemption-threshold (get facts/catalog "ZAF"))]
+        (is (= 100 (:ceiling-mw t)))
+        (is (= :registration (:requires t)))
+        (is (re-find #"Gazette 44989" (:source t))
+            "a threshold without its instrument is a fabrication with a number on it"))))
+  (testing "every other entry admits its thresholds are unverified"
+    (doseq [k (remove #{"ZAF"} (national-keys))]
+      (is (seq (:exemption-note (get facts/catalog k))) k)
+      (is (nil? (:exemption-threshold (get facts/catalog k))) k))))
+
+(deftest secondary-sourced-entries-say-so
+  (testing "an entry resting on practitioner guides rather than the instrument declares it"
+    (is (re-find #"SECONDARY" (:verification-note (get facts/catalog "KOR"))))
+    (testing "and it withholds a right rather than granting one"
+      (is (false? (facts/permits? "KOR" :sell)))))
+  (testing "entries whose scope is narrower than their country say where the line is"
+    (doseq [k ["USA" "CAN" "AUS" "GBR" "IND"]]
+      (is (seq (:jurisdiction-note (get facts/catalog k))) k))))

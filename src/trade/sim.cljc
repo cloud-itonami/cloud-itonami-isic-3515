@@ -27,6 +27,7 @@
   settlement record, and the independently replayed order book -- the
   same book any third party holding the public log would derive."
   (:require [langgraph.graph :as g]
+            [trade.facts :as facts]
             [trade.matching :as matching]
             [trade.registry :as registry]
             [trade.store :as store]
@@ -82,14 +83,14 @@
                         "µ/Wh (25 JPY/kWh) -- always escalates")
                    {:op :actuation/place-order :subject "p-1"
                     :interval-id "iv-1" :order-id "o-1" :side :sell
-                    :qty-wh 2000 :price-minor ask-price})
+                    :qty-wh 2000 :price-minor ask-price :currency "JPY"})
 
     (step-approve! actor "t8"
                    (str "actuation/place-order p-2 BUY 2000Wh @" bid-price
                         "µ/Wh (26 JPY/kWh) -- crosses, fills at the MAKER's 25 JPY/kWh")
                    {:op :actuation/place-order :subject "p-2"
                     :interval-id "iv-1" :order-id "o-2" :side :buy
-                    :qty-wh 2000 :price-minor bid-price})
+                    :qty-wh 2000 :price-minor bid-price :currency "JPY"})
 
     (step-approve! actor "t9" "meter/submit iv-1 / p-1 (+1950 Wh exported -- 50 Wh short)"
                    {:op :meter/submit :subject "iv-1"
@@ -109,7 +110,7 @@
     (step! actor "t13" "actuation/place-order p-3 SELL (no :sell right on file -> HARD hold)"
            {:op :actuation/place-order :subject "p-3"
             :interval-id "iv-1" :order-id "o-3" :side :sell
-            :qty-wh 1000 :price-minor ask-price})
+            :qty-wh 1000 :price-minor ask-price :currency "JPY"})
 
     (step-approve! actor "t14" "license/verify p-5 (JPN; sets up the capacity test)"
                    {:op :license/verify :subject "p-5"})
@@ -118,7 +119,7 @@
                 (registry/deliverable-wh 100 30) " Wh -> HARD hold")
            {:op :actuation/place-order :subject "p-5"
             :interval-id "iv-1" :order-id "o-4" :side :sell
-            :qty-wh 2000 :price-minor ask-price})
+            :qty-wh 2000 :price-minor ask-price :currency "JPY"})
 
     (step! actor "t16" "conduct/screen p-4 (unresolved market-abuse flag -> HARD hold)"
            {:op :conduct/screen :subject "p-4"})
@@ -128,10 +129,56 @@
     (step! actor "t18" "actuation/place-order p-1 into iv-2 (gate already closed -> HARD hold)"
            {:op :actuation/place-order :subject "p-1"
             :interval-id "iv-2" :order-id "o-5" :side :sell
-            :qty-wh 1000 :price-minor ask-price})
+            :qty-wh 1000 :price-minor ask-price :currency "JPY"})
 
     (step! actor "t19" "actuation/settle-interval iv-1 AGAIN (double settlement -> HARD hold)"
            {:op :actuation/settle-interval :subject "iv-1"})
+
+    (println "\n=== WORLDWIDE: the same actor, five regulatory shapes ===\n")
+
+    (step-approve! actor "g1" "license/verify p-6 (ESP -- no national entry; resolves to the EU BLOC)"
+                   {:op :license/verify :subject "p-6"})
+    (step-approve! actor "g2" "conduct/screen p-6"
+                   {:op :conduct/screen :subject "p-6"})
+    (step-approve! actor "g3"
+                   "actuation/place-order p-6 SELL on the EUR book -- Dir. (EU) 2018/2001 Art.21(2)(a) names peer-to-peer trading"
+                   {:op :actuation/place-order :subject "p-6"
+                    :interval-id "iv-eu" :order-id "eu-1" :side :sell
+                    :qty-wh 2000 :price-minor 90000 :currency "EUR"})
+
+    (step-approve! actor "g4" "license/verify p-8 (USA federal: grants :sell-wholesale, NOT :sell)"
+                   {:op :license/verify :subject "p-8"})
+    (step! actor "g5" "actuation/place-order p-8 SELL -- wholesale right is the WRONG right here -> HARD hold"
+           {:op :actuation/place-order :subject "p-8"
+            :interval-id "iv-1" :order-id "us-1" :side :sell
+            :qty-wh 1000 :price-minor ask-price :currency "JPY"})
+
+    (step-approve! actor "g6" "license/verify p-9 (KOR: retail licence exists but only KEPCO holds one)"
+                   {:op :license/verify :subject "p-9"})
+    (step! actor "g7" "actuation/place-order p-9 SELL -- jurisdiction grants :generate only -> HARD hold"
+           {:op :actuation/place-order :subject "p-9"
+            :interval-id "iv-1" :order-id "kr-1" :side :sell
+            :qty-wh 1000 :price-minor ask-price :currency "JPY"})
+
+    (step-approve! actor "g8" "license/verify p-10 (IND: generation DE-LICENSED s.7, trading licensed s.12)"
+                   {:op :license/verify :subject "p-10"})
+
+    (step! actor "g9" "actuation/place-order p-1 with currency EUR on the JPY book -> HARD hold"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-1" :order-id "x-1" :side :sell
+            :qty-wh 100 :price-minor ask-price :currency "EUR"})
+
+    (step! actor "g10" "actuation/place-order p-1 BUY across p-6's Spanish ask, no cross-border basis -> HARD hold"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-eu" :order-id "x-2" :side :buy
+            :qty-wh 2000 :price-minor 95000 :currency "EUR"})
+
+    (println "\n=== coverage, reported honestly ===")
+    (let [c (facts/coverage)]
+      (println "national entries (fetched and read):" (:covered-directly c))
+      (println "resolving via the EU bloc:" (count (:covered-via-bloc c)) "member states")
+      (println "granting :generate but NOT :sell:" (facts/jurisdictions-without-sell-right))
+      (println (:note c)))
 
     (println "\n=== audit ledger ===")
     (doseq [f (store/ledger db)] (println f))
