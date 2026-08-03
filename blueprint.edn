@@ -1,0 +1,19 @@
+{:itonami.blueprint/id "cloud-itonami-isic-3515"
+ :itonami.blueprint/name "Peer-to-Peer Electricity Trade"
+ :itonami.blueprint/isic-rev5 "3515"
+ :itonami.blueprint/isic-rev5-title "Trade of electricity"
+ :itonami.blueprint/domain :energy/electricity-trade
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:energy-affordability :decarbonization
+                                   :market-access :resilience]
+ :itonami.blueprint/governor :market-conduct-governor
+ :itonami.blueprint/robotics false
+ :itonami.blueprint/required-technologies [:matching-engine :audit-ledger :metering
+                                           :dmn :bpmn :forms]
+ :itonami.blueprint/optional-technologies [:forecasting :optimization]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/maturity :implemented
+ :itonami.blueprint/value-chain-siblings
+ {"cloud-itonami-isic-3511" "generation (non-renewable / SMR compliance)"
+  "cloud-itonami-isic-3512" "generation (community renewables)"
+  "cloud-itonami-isic-3510" "transmission & distribution (the wires)"}}

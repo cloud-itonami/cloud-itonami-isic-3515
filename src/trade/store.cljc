@@ -1,0 +1,452 @@
+(ns trade.store
+  "SSoT for the electricity-trade actor, behind a `Store` protocol so the
+  backend is a swap, not a rewrite -- the same seam every prior `cloud-
+  itonami-isic-*` actor in this fleet uses:
+
+    - `MemStore`     -- atom of EDN. The deterministic default for
+                        dev/tests/demo (no deps).
+    - `DatomicStore` -- backed by `langchain.db`, a Datomic-API-compatible
+                        EAV store (datalog q / pull / upsert). Pure `.cljc`,
+                        so it runs offline AND can be pointed at a real
+                        Datomic Local or a kotoba-server pod by swapping
+                        `langchain.db`'s `:db-api`.
+
+  Both implement the same protocol and pass the same contract
+  (test/trade/store_contract_test.clj), which is the whole point: the
+  actor, the Market Conduct Governor and the audit ledger never know
+  which SSoT they run on.
+
+  ── The order log is the market's only source of truth ──
+
+  This store does NOT persist a materialised order book. It persists the
+  totally-ordered ORDER LOG per delivery interval, and every reader --
+  the governor, the settlement computation, an outside auditor --
+  re-derives the book with `trade.matching/replay-book`. There is
+  therefore no cached book that can silently disagree with the log, and
+  no state an operator could edit to produce a fill that the public log
+  does not imply.
+
+  Gate closure follows the same rule: it is a `:close-gate` EVENT in the
+  log, not a mutable flag on the interval entity. An interval whose gate
+  is closed is one whose log says so.
+
+  ── Two actuations, one entity each ──
+
+  Like every prior dual-actuation sibling, this actor has TWO actuation
+  events acting on DIFFERENT entities: placing an order (a participant
+  acting on an interval's log) and settling an interval (the interval
+  itself). Each has its own history collection and jurisdiction-scoped
+  sequence counter. Settlement carries the dedicated double-actuation
+  guard `:settled?` -- a boolean, never a `:status` value, the discipline
+  informed by `cloud-itonami-isic-6492`'s status-lifecycle bug
+  (ADR-2607071320). Order placement deliberately has NO such guard:
+  placing many orders is the normal use of a market, and duplicate
+  ORDER IDs are refused by the matching engine's own `:duplicate-id`
+  validation rather than by a store-level boolean.
+
+  The ledger stays append-only on every backend: 'who was licensed to
+  sell, on what jurisdictional basis, which order was admitted to which
+  interval, what the meters actually read, and who approved the
+  settlement' is always a query over an immutable log."
+  (:require [trade.matching :as matching]
+            [trade.registry :as registry]
+            [langchain.db :as d]
+            [langchain-store.core :as ls]))
+
+(defprotocol Store
+  (participant [s id])
+  (all-participants [s])
+  (licence-of [s participant-id] "committed licence verification for a participant, or nil")
+  (conduct-screen-of [s participant-id] "committed market-conduct screening verdict, or nil")
+  (interval [s id])
+  (all-intervals [s])
+  (order-log [s interval-id] "the append-only, interval-scoped order event log")
+  (meter-reading-of [s interval-id participant-id] "committed meter reading, or nil")
+  (ledger [s])
+  (order-history [s] "the append-only order-placement history (trade.registry drafts)")
+  (settlement-history [s] "the append-only interval-settlement history (trade.registry drafts)")
+  (next-order-sequence [s jurisdiction] "next order-number sequence for a jurisdiction")
+  (next-settlement-sequence [s jurisdiction] "next settlement-number sequence for a jurisdiction")
+  (interval-already-settled? [s interval-id] "has this interval already been settled?")
+  (commit-record! [s record] "apply a committed op's record to the SSoT")
+  (append-ledger! [s fact] "append one immutable decision fact")
+  (with-participants [s participants] "replace/seed the participant directory (map id->participant)")
+  (with-intervals [s intervals] "replace/seed the interval directory (map id->interval)")
+  (with-order-logs [s logs] "replace/seed the per-interval order logs (map interval-id->[event])"))
+
+;; ----------------------------- demo data -----------------------------
+
+(defn demo-data
+  "A small, self-contained participant/interval set covering the whole
+  failure surface (unknown jurisdiction, unresolved market-abuse flag,
+  a seller too small to deliver what it offers, a closed gate) so the
+  actor + tests run offline."
+  []
+  {:participants
+   {"p-1" {:id "p-1" :display-name "鈴木家 屋根置き太陽光+蓄電池"
+           :role :prosumer :jurisdiction "JPN" :capacity-w 6000
+           :market-abuse-flag-unresolved? false :status :intake}
+    "p-2" {:id "p-2" :display-name "さくら保育園"
+           :role :consumer :jurisdiction "JPN" :capacity-w 0
+           :market-abuse-flag-unresolved? false :status :intake}
+    "p-3" {:id "p-3" :display-name "Atlantis Off-Grid Co-op"
+           :role :prosumer :jurisdiction "ATL" :capacity-w 4000
+           :market-abuse-flag-unresolved? false :status :intake}
+    "p-4" {:id "p-4" :display-name "田中電力(市場行為フラグ有)"
+           :role :generator :jurisdiction "JPN" :capacity-w 8000
+           :market-abuse-flag-unresolved? true :status :intake}
+    "p-5" {:id "p-5" :display-name "ベランダ発電 100W"
+           :role :generator :jurisdiction "JPN" :capacity-w 100
+           :market-abuse-flag-unresolved? false :status :intake}}
+
+   :intervals
+   {"iv-1" {:id "iv-1" :starts-at-iso "2026-08-04T09:00:00Z"
+            :duration-minutes 30 :jurisdiction "JPN"
+            :settled? false :settlement-number nil}
+    "iv-2" {:id "iv-2" :starts-at-iso "2026-08-04T09:30:00Z"
+            :duration-minutes 30 :jurisdiction "JPN"
+            :settled? false :settlement-number nil}}
+
+   ;; iv-2's gate is already closed -- seeded as the EVENT that closes
+   ;; it, because the log is the only source of gate state.
+   :order-logs {"iv-1" []
+                "iv-2" [{:kind :close-gate :seq 1}]}})
+
+;; ------------------------- shared commit logic -------------------------
+
+(defn- place-order!
+  "Backend-agnostic `:interval/place-order` -- replays the interval's log
+  to find the next `:seq`, builds the order EVENT, and drafts the
+  order-placement record. Returns {:event .. :result ..} for the caller
+  to persist.
+
+  The event's `:seq` is derived from the replayed log rather than from a
+  stored counter, so a log and its sequence can never drift apart."
+  [s participant-id interval-id {:keys [order-id side qty-wh price-minor]}]
+  (let [p (participant s participant-id)
+        log (order-log s interval-id)
+        event {:kind :order
+               :seq (matching/next-seq log)
+               :id order-id
+               :account participant-id
+               :side side
+               :price-minor price-minor
+               :qty-minor qty-wh}
+        seq-n (next-order-sequence s (:jurisdiction p))
+        result (registry/register-order participant-id interval-id (:jurisdiction p)
+                                        side qty-wh price-minor seq-n)]
+    {:event event :result result}))
+
+(defn- interval-positions
+  "Every participant's net position for `interval-id`, computed from the
+  REPLAYED order log and the committed meter readings.
+
+  `:contracted-wh` is net delivery obligation: sold minus bought, so a
+  positive figure means the participant owes power to the market and a
+  negative figure means the market owes power to it. `:metered-wh` is
+  the participant's own committed reading on the same sign convention
+  (positive = net export). `:imbalance-wh` is metered minus contracted,
+  and is nil when the reading is missing -- which `trade.registry/
+  register-settlement` then refuses to build a record from.
+
+  `:money-micro` is what the participant is owed (positive) or owes
+  (negative) in micro currency units, from the fills alone: exact
+  integer arithmetic, no rounding."
+  [s interval-id]
+  (let [{:keys [fills] :as re} (matching/replay-book (order-log s interval-id))
+        ids (matching/accounts-with-fills re)]
+    (mapv (fn [pid]
+            (let [sold (reduce + 0 (map :qty-minor (filter #(= (:seller %) pid) fills)))
+                  bought (matching/contracted-buy-wh re pid)
+                  contracted (- sold bought)
+                  earned (reduce + 0 (map matching/fill-money-micro
+                                          (filter #(= (:seller %) pid) fills)))
+                  paid (reduce + 0 (map matching/fill-money-micro
+                                        (filter #(= (:buyer %) pid) fills)))
+                  metered (:metered-wh (meter-reading-of s interval-id pid))]
+              {:participant-id pid
+               :contracted-wh contracted
+               :metered-wh metered
+               :imbalance-wh (registry/imbalance-wh metered contracted)
+               :money-micro (- earned paid)}))
+          ids)))
+
+(defn- settle-interval!
+  "Backend-agnostic `:interval/mark-settled` -- computes every
+  participant's position and drafts the settlement record. Returns
+  {:result .. :interval-patch ..} for the caller to persist."
+  [s interval-id]
+  (let [iv (interval s interval-id)
+        positions (interval-positions s interval-id)
+        seq-n (next-settlement-sequence s (:jurisdiction iv))
+        result (registry/register-settlement interval-id (:jurisdiction iv) positions seq-n)]
+    {:result result
+     :interval-patch {:settled? true
+                      :settlement-number (get result "settlement_number")}}))
+
+;; ----------------------------- MemStore -----------------------------
+
+(defrecord MemStore [a]
+  Store
+  (participant [_ id] (get-in @a [:participants id]))
+  (all-participants [_] (sort-by :id (vals (:participants @a))))
+  (licence-of [_ pid] (get-in @a [:licences pid]))
+  (conduct-screen-of [_ pid] (get-in @a [:conduct-screens pid]))
+  (interval [_ id] (get-in @a [:intervals id]))
+  (all-intervals [_] (sort-by :id (vals (:intervals @a))))
+  (order-log [_ iid] (vec (get-in @a [:order-logs iid] [])))
+  (meter-reading-of [_ iid pid] (get-in @a [:meter-readings [iid pid]]))
+  (ledger [_] (:ledger @a))
+  (order-history [_] (:orders @a))
+  (settlement-history [_] (:settlements @a))
+  (next-order-sequence [_ j] (get-in @a [:order-sequences j] 0))
+  (next-settlement-sequence [_ j] (get-in @a [:settlement-sequences j] 0))
+  (interval-already-settled? [_ iid] (boolean (get-in @a [:intervals iid :settled?])))
+  (commit-record! [s {:keys [effect path value payload]}]
+    (case effect
+      :participant/upsert
+      (swap! a update-in [:participants (:id value)] merge value)
+
+      :interval/upsert
+      (swap! a update-in [:intervals (:id value)] merge value)
+
+      :licence/set
+      (swap! a assoc-in [:licences (first path)] payload)
+
+      :conduct-screen/set
+      (swap! a assoc-in [:conduct-screens (first path)] payload)
+
+      :meter/set
+      (swap! a assoc-in [:meter-readings [(first path) (second path)]] payload)
+
+      :interval/place-order
+      (let [interval-id (first path)
+            {:keys [event result]} (place-order! s (:participant-id value) interval-id value)
+            j (:jurisdiction (participant s (:participant-id value)))]
+        (swap! a (fn [st]
+                   (-> st
+                       (update-in [:order-logs interval-id] (fnil conj []) event)
+                       (update-in [:order-sequences j] (fnil inc 0))
+                       (update :orders registry/append result))))
+        result)
+
+      :interval/mark-settled
+      (let [interval-id (first path)
+            {:keys [result interval-patch]} (settle-interval! s interval-id)
+            j (:jurisdiction (interval s interval-id))]
+        (swap! a (fn [st]
+                   (-> st
+                       (update-in [:settlement-sequences j] (fnil inc 0))
+                       (update-in [:intervals interval-id] merge interval-patch)
+                       (update :settlements registry/append result))))
+        result)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (with-participants [s ps] (when (seq ps) (swap! a assoc :participants ps)) s)
+  (with-intervals [s is] (when (seq is) (swap! a assoc :intervals is)) s)
+  (with-order-logs [s logs] (when (seq logs) (swap! a assoc :order-logs logs)) s))
+
+(defn seed-db
+  "A MemStore seeded with the demo participant/interval set. The
+  deterministic default."
+  []
+  (->MemStore (atom (merge (demo-data)
+                           {:licences {} :conduct-screens {} :meter-readings {}
+                            :ledger [] :orders [] :settlements []
+                            :order-sequences {} :settlement-sequences {}}))))
+
+;; --------------------- DatomicStore (langchain.db) ---------------------
+
+(def ^:private schema
+  "DataScript/Datomic-style schema: only constraint attrs are declared.
+  Map/compound values (licence/conduct-screen/meter payloads, order
+  events, ledger facts, order/settlement records) are stored as EDN
+  strings so `langchain.db` doesn't expand them into sub-entities -- the
+  same convention every sibling actor's store uses. The identity-schema
+  builder, EDN-blob codec and seq-keyed event-log read/append are the
+  shared kotoba-lang/langchain-store machinery (ADR-2607141600)."
+  (ls/identity-schema
+   [:participant/id :interval/id
+    :licence/participant-id :conduct-screen/participant-id
+    :meter/key :order-event/key
+    :ledger/seq :order/seq :settlement/seq
+    :order-sequence/jurisdiction :settlement-sequence/jurisdiction]))
+
+(defn- participant->tx
+  [{:keys [id display-name role jurisdiction capacity-w
+           market-abuse-flag-unresolved? status]}]
+  (cond-> {:participant/id id}
+    display-name (assoc :participant/display-name display-name)
+    role (assoc :participant/role role)
+    jurisdiction (assoc :participant/jurisdiction jurisdiction)
+    (some? capacity-w) (assoc :participant/capacity-w capacity-w)
+    (some? market-abuse-flag-unresolved?)
+    (assoc :participant/market-abuse-flag-unresolved? market-abuse-flag-unresolved?)
+    status (assoc :participant/status status)))
+
+(def ^:private participant-pull
+  [:participant/id :participant/display-name :participant/role
+   :participant/jurisdiction :participant/capacity-w
+   :participant/market-abuse-flag-unresolved? :participant/status])
+
+(defn- pull->participant [m]
+  (when (:participant/id m)
+    {:id (:participant/id m)
+     :display-name (:participant/display-name m)
+     :role (:participant/role m)
+     :jurisdiction (:participant/jurisdiction m)
+     :capacity-w (:participant/capacity-w m)
+     :market-abuse-flag-unresolved? (boolean (:participant/market-abuse-flag-unresolved? m))
+     :status (:participant/status m)}))
+
+(defn- interval->tx
+  [{:keys [id starts-at-iso duration-minutes jurisdiction settled? settlement-number]}]
+  (cond-> {:interval/id id}
+    starts-at-iso (assoc :interval/starts-at-iso starts-at-iso)
+    (some? duration-minutes) (assoc :interval/duration-minutes duration-minutes)
+    jurisdiction (assoc :interval/jurisdiction jurisdiction)
+    (some? settled?) (assoc :interval/settled? settled?)
+    settlement-number (assoc :interval/settlement-number settlement-number)))
+
+(def ^:private interval-pull
+  [:interval/id :interval/starts-at-iso :interval/duration-minutes
+   :interval/jurisdiction :interval/settled? :interval/settlement-number])
+
+(defn- pull->interval [m]
+  (when (:interval/id m)
+    {:id (:interval/id m)
+     :starts-at-iso (:interval/starts-at-iso m)
+     :duration-minutes (:interval/duration-minutes m)
+     :jurisdiction (:interval/jurisdiction m)
+     :settled? (boolean (:interval/settled? m))
+     :settlement-number (:interval/settlement-number m)}))
+
+(defrecord DatomicStore [conn]
+  Store
+  (participant [_ id]
+    (pull->participant (d/pull (d/db conn) participant-pull [:participant/id id])))
+  (all-participants [_]
+    (->> (d/q '[:find [?id ...] :where [?e :participant/id ?id]] (d/db conn))
+         (map #(pull->participant (d/pull (d/db conn) participant-pull [:participant/id %])))
+         (sort-by :id)))
+  (licence-of [_ pid]
+    (ls/dec* (d/q '[:find ?p . :in $ ?pid
+                    :where [?e :licence/participant-id ?pid] [?e :licence/payload ?p]]
+                  (d/db conn) pid)))
+  (conduct-screen-of [_ pid]
+    (ls/dec* (d/q '[:find ?p . :in $ ?pid
+                    :where [?e :conduct-screen/participant-id ?pid] [?e :conduct-screen/payload ?p]]
+                  (d/db conn) pid)))
+  (interval [_ id]
+    (pull->interval (d/pull (d/db conn) interval-pull [:interval/id id])))
+  (all-intervals [_]
+    (->> (d/q '[:find [?id ...] :where [?e :interval/id ?id]] (d/db conn))
+         (map #(pull->interval (d/pull (d/db conn) interval-pull [:interval/id %])))
+         (sort-by :id)))
+  (order-log [_ iid]
+    ;; Events are stored one entity each, keyed "<interval-id>|<seq>", and
+    ;; re-sorted by their OWN interval-scoped :seq on read -- the storage
+    ;; order is irrelevant, the log's own total order is what matters.
+    (->> (d/q '[:find [?e ...] :in $ ?iid
+                :where [?e :order-event/interval-id ?iid]]
+              (d/db conn) iid)
+         (map #(ls/dec* (:order-event/event (d/pull (d/db conn) [:order-event/event] %))))
+         (sort-by :seq)
+         vec))
+  (meter-reading-of [_ iid pid]
+    (ls/dec* (d/q '[:find ?p . :in $ ?k
+                    :where [?e :meter/key ?k] [?e :meter/payload ?p]]
+                  (d/db conn) (str iid "|" pid))))
+  (ledger [_] (ls/read-stream conn :ledger/seq :ledger/fact))
+  (order-history [_] (ls/read-stream conn :order/seq :order/record))
+  (settlement-history [_] (ls/read-stream conn :settlement/seq :settlement/record))
+  (next-order-sequence [_ j]
+    (or (d/q '[:find ?n . :in $ ?j
+               :where [?e :order-sequence/jurisdiction ?j] [?e :order-sequence/next ?n]]
+             (d/db conn) j)
+        0))
+  (next-settlement-sequence [_ j]
+    (or (d/q '[:find ?n . :in $ ?j
+               :where [?e :settlement-sequence/jurisdiction ?j] [?e :settlement-sequence/next ?n]]
+             (d/db conn) j)
+        0))
+  (interval-already-settled? [s iid] (boolean (:settled? (interval s iid))))
+  (commit-record! [s {:keys [effect path value payload]}]
+    (case effect
+      :participant/upsert
+      (d/transact! conn [(participant->tx value)])
+
+      :interval/upsert
+      (d/transact! conn [(interval->tx value)])
+
+      :licence/set
+      (d/transact! conn [{:licence/participant-id (first path)
+                          :licence/payload (ls/enc payload)}])
+
+      :conduct-screen/set
+      (d/transact! conn [{:conduct-screen/participant-id (first path)
+                          :conduct-screen/payload (ls/enc payload)}])
+
+      :meter/set
+      (d/transact! conn [{:meter/key (str (first path) "|" (second path))
+                          :meter/payload (ls/enc payload)}])
+
+      :interval/place-order
+      (let [interval-id (first path)
+            {:keys [event result]} (place-order! s (:participant-id value) interval-id value)
+            j (:jurisdiction (participant s (:participant-id value)))
+            next-n (inc (next-order-sequence s j))]
+        (d/transact! conn
+                     [{:order-event/key (str interval-id "|" (:seq event))
+                       :order-event/interval-id interval-id
+                       :order-event/event (ls/enc event)}
+                      {:order-sequence/jurisdiction j :order-sequence/next next-n}
+                      {:order/seq (count (order-history s))
+                       :order/record (ls/enc (get result "record"))}])
+        result)
+
+      :interval/mark-settled
+      (let [interval-id (first path)
+            {:keys [result interval-patch]} (settle-interval! s interval-id)
+            j (:jurisdiction (interval s interval-id))
+            next-n (inc (next-settlement-sequence s j))]
+        (d/transact! conn
+                     [(interval->tx (assoc interval-patch :id interval-id))
+                      {:settlement-sequence/jurisdiction j :settlement-sequence/next next-n}
+                      {:settlement/seq (count (settlement-history s))
+                       :settlement/record (ls/enc (get result "record"))}])
+        result)
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (ls/append-blob! conn :ledger/seq :ledger/fact (count (ledger s)) fact)
+    fact)
+  (with-participants [s ps]
+    (when (seq ps) (d/transact! conn (mapv participant->tx (vals ps)))) s)
+  (with-intervals [s is]
+    (when (seq is) (d/transact! conn (mapv interval->tx (vals is)))) s)
+  (with-order-logs [s logs]
+    (doseq [[iid events] logs
+            event events]
+      (d/transact! conn [{:order-event/key (str iid "|" (:seq event))
+                          :order-event/interval-id iid
+                          :order-event/event (ls/enc event)}]))
+    s))
+
+(defn datomic-store
+  "A DatomicStore (langchain.db backend) seeded from `data`; empty when
+  omitted."
+  ([] (datomic-store {}))
+  ([{:keys [participants intervals order-logs]}]
+   (let [s (->DatomicStore (d/create-conn schema))]
+     (-> s
+         (with-participants participants)
+         (with-intervals intervals)
+         (with-order-logs order-logs)))))
+
+(defn datomic-seed-db
+  "A DatomicStore seeded with the demo set -- the Datomic-backed analog
+  of `seed-db`, used to prove protocol parity."
+  []
+  (datomic-store (demo-data)))

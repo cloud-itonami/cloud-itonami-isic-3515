@@ -1,0 +1,154 @@
+(ns trade.sim
+  "Demo driver -- `clojure -M:dev:run`. Walks a complete peer-to-peer
+  electricity trade end to end:
+
+    register a household prosumer and a nursery school
+    -> verify each one's market-participation licence basis (JPN)
+    -> screen both for market abuse
+    -> the prosumer SELLS 2000 Wh into the 09:00 interval (escalates,
+       human approves)
+    -> the school BUYS it (escalates, human approves) -- the book
+       matches them at the maker's price
+    -> both submit meter readings
+    -> the interval is SETTLED (escalates, human approves)
+
+  then shows the HARD holds that never reach a human at all:
+
+    - a jurisdiction with no spec-basis (ATL)
+    - a sale by a participant with no `:sell` right on file
+    - a 100 W balcony generator offering 2000 Wh it cannot physically
+      produce in 30 minutes
+    - an unresolved market-abuse flag
+    - an order into an interval whose gate has already closed
+    - a settlement over a participant with no meter reading
+    - a double settlement of an already-settled interval
+
+  and finally prints the audit ledger, the draft order records, the
+  settlement record, and the independently replayed order book -- the
+  same book any third party holding the public log would derive."
+  (:require [langgraph.graph :as g]
+            [trade.matching :as matching]
+            [trade.registry :as registry]
+            [trade.store :as store]
+            [trade.operation :as op]))
+
+(def operator {:actor-id "op-1" :actor-role :exchange-operator :phase 3})
+
+;; 25 JPY/kWh and 26 JPY/kWh as integer µJPY/Wh.
+(def ^:private ask-price (registry/kwh-price->minor 25))
+(def ^:private bid-price (registry/kwh-price->minor 26))
+
+(defn- exec! [actor tid request context]
+  (g/run* actor {:request request :context context} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}} {:thread-id tid :resume? true}))
+
+(defn- step! [actor tid label request]
+  (println (str "== " label " =="))
+  (println (exec! actor tid request operator)))
+
+(defn- step-approve! [actor tid label request]
+  (step! actor tid label request)
+  (println "-- human exchange operator approves --")
+  (println (approve! actor tid)))
+
+(defn -main [& _]
+  (let [db (store/seed-db)
+        actor (op/build db)]
+
+    (println "=== HAPPY PATH: a household sells 2000 Wh to a nursery school ===\n")
+
+    (step! actor "t1" "participant/register p-1 (JPN prosumer, 6000 W)"
+           {:op :participant/register :subject "p-1"
+            :patch {:id "p-1" :display-name "鈴木家 屋根置き太陽光+蓄電池"}})
+
+    (step! actor "t2" "participant/register p-2 (JPN consumer)"
+           {:op :participant/register :subject "p-2"
+            :patch {:id "p-2" :display-name "さくら保育園"}})
+
+    (step-approve! actor "t3" "license/verify p-1 (JPN: 発電=届出 / 小売=登録)"
+                   {:op :license/verify :subject "p-1"})
+    (step-approve! actor "t4" "license/verify p-2 (JPN)"
+                   {:op :license/verify :subject "p-2"})
+
+    (step-approve! actor "t5" "conduct/screen p-1 (clean)"
+                   {:op :conduct/screen :subject "p-1"})
+    (step-approve! actor "t6" "conduct/screen p-2 (clean)"
+                   {:op :conduct/screen :subject "p-2"})
+
+    (step-approve! actor "t7"
+                   (str "actuation/place-order p-1 SELL 2000Wh @" ask-price
+                        "µ/Wh (25 JPY/kWh) -- always escalates")
+                   {:op :actuation/place-order :subject "p-1"
+                    :interval-id "iv-1" :order-id "o-1" :side :sell
+                    :qty-wh 2000 :price-minor ask-price})
+
+    (step-approve! actor "t8"
+                   (str "actuation/place-order p-2 BUY 2000Wh @" bid-price
+                        "µ/Wh (26 JPY/kWh) -- crosses, fills at the MAKER's 25 JPY/kWh")
+                   {:op :actuation/place-order :subject "p-2"
+                    :interval-id "iv-1" :order-id "o-2" :side :buy
+                    :qty-wh 2000 :price-minor bid-price})
+
+    (step-approve! actor "t9" "meter/submit iv-1 / p-1 (+1950 Wh exported -- 50 Wh short)"
+                   {:op :meter/submit :subject "iv-1"
+                    :participant-id "p-1" :metered-wh 1950})
+    (step-approve! actor "t10" "meter/submit iv-1 / p-2 (-2000 Wh imported)"
+                   {:op :meter/submit :subject "iv-1"
+                    :participant-id "p-2" :metered-wh -2000})
+
+    (step-approve! actor "t11" "actuation/settle-interval iv-1 -- always escalates"
+                   {:op :actuation/settle-interval :subject "iv-1"})
+
+    (println "\n=== HARD HOLDS: none of these ever reach a human ===\n")
+
+    (step! actor "t12" "license/verify p-3 (ATL: no spec-basis -> HARD hold)"
+           {:op :license/verify :subject "p-3" :no-spec? true})
+
+    (step! actor "t13" "actuation/place-order p-3 SELL (no :sell right on file -> HARD hold)"
+           {:op :actuation/place-order :subject "p-3"
+            :interval-id "iv-1" :order-id "o-3" :side :sell
+            :qty-wh 1000 :price-minor ask-price})
+
+    (step-approve! actor "t14" "license/verify p-5 (JPN; sets up the capacity test)"
+                   {:op :license/verify :subject "p-5"})
+    (step! actor "t15"
+           (str "actuation/place-order p-5 SELL 2000Wh -- 100 W over 30 min can deliver only "
+                (registry/deliverable-wh 100 30) " Wh -> HARD hold")
+           {:op :actuation/place-order :subject "p-5"
+            :interval-id "iv-1" :order-id "o-4" :side :sell
+            :qty-wh 2000 :price-minor ask-price})
+
+    (step! actor "t16" "conduct/screen p-4 (unresolved market-abuse flag -> HARD hold)"
+           {:op :conduct/screen :subject "p-4"})
+
+    (step-approve! actor "t17" "license/verify p-1 is already on file; place-order into iv-2"
+                   {:op :conduct/screen :subject "p-1"})
+    (step! actor "t18" "actuation/place-order p-1 into iv-2 (gate already closed -> HARD hold)"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-2" :order-id "o-5" :side :sell
+            :qty-wh 1000 :price-minor ask-price})
+
+    (step! actor "t19" "actuation/settle-interval iv-1 AGAIN (double settlement -> HARD hold)"
+           {:op :actuation/settle-interval :subject "iv-1"})
+
+    (println "\n=== audit ledger ===")
+    (doseq [f (store/ledger db)] (println f))
+
+    (println "\n=== draft order records ===")
+    (doseq [r (store/order-history db)] (println r))
+
+    (println "\n=== draft settlement records ===")
+    (doseq [r (store/settlement-history db)] (println r))
+
+    (println "\n=== iv-1 order log (the public record) ===")
+    (doseq [e (store/order-log db "iv-1")] (println e))
+
+    (println "\n=== iv-1 book, INDEPENDENTLY replayed from that log ===")
+    (let [{:keys [book fills]} (matching/replay-book (store/order-log db "iv-1"))]
+      (println "book:" book)
+      (doseq [f fills]
+        (println "fill:" f
+                 "=> money" (registry/micro->units (matching/fill-money-micro f))
+                 "JPY")))))

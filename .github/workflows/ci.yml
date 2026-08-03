@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# This actor's deps.edn resolves io.github.com-junkawasaki/langgraph-clj
+# and io.github.kotoba-lang/langchain-store via :local/root two levels up
+# (the in-monorepo layout: orgs/cloud-itonami/<this> + orgs/kotoba-lang/*).
+# A bare single-repo checkout can't see those siblings, so CI reconstructs
+# the relevant slice of the monorepo layout -- langchain-store's own
+# deps.edn in turn needs kotoba-lang/langchain at the same relative depth,
+# so it is checked out too. Siblings are tested at their default branch.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this actor
+        uses: actions/checkout@v4
+        with:
+          path: cloud-itonami/cloud-itonami-isic-3515
+
+      - name: Checkout langgraph
+        uses: actions/checkout@v4
+        with: { repository: kotoba-lang/langgraph, path: kotoba-lang/langgraph }
+      - name: Checkout langchain-store
+        uses: actions/checkout@v4
+        with: { repository: kotoba-lang/langchain-store, path: kotoba-lang/langchain-store }
+      - name: Checkout langchain
+        uses: actions/checkout@v4
+        with: { repository: kotoba-lang/langchain, path: kotoba-lang/langchain }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+
+      - name: Cache m2 / gitlibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+          key: ${{ runner.os }}-clj-${{ hashFiles('cloud-itonami/cloud-itonami-isic-3515/deps.edn') }}
+          restore-keys: ${{ runner.os }}-clj-
+
+      - name: Lint
+        working-directory: cloud-itonami/cloud-itonami-isic-3515
+        run: clojure -M:lint
+      - name: Test
+        working-directory: cloud-itonami/cloud-itonami-isic-3515
+        run: clojure -M:test
