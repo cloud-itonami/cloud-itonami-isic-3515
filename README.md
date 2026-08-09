@@ -289,9 +289,10 @@ money.
 ## Run it
 
 ```bash
-clojure -M:dev:test    # 73 tests, 568 assertions
-clojure -M:lint        # clj-kondo, errors fail CI
-clojure -M:dev:run     # a complete trade, then every HARD hold
+clojure -M:dev:test         # 73 tests, 568 assertions
+clojure -M:lint             # clj-kondo, errors fail CI
+clojure -M:dev:run          # a complete trade, then every HARD hold
+clojure -M:dev:render-html  # regenerate docs/samples/operator-console.html
 ```
 
 The demo registers a household prosumer and a nursery school, licenses
@@ -309,6 +310,20 @@ regime where generation is de-licensed outright; a JPY book refuses a
 EUR order; and a Japan–Spain match is held for want of a declared
 cross-border basis. It finishes by replaying the public order log to
 re-derive the same book and the same 50.00 JPY fill.
+
+`docs/samples/operator-console.html` is the same actor's output rendered
+as an operator console. It is **generated at build time by running the
+actor** (`trade.render-html`), not hand-written: every id, price, fill,
+money leg, permit set and hold reason on the page was read back out of a
+real `trade.operation` run over a freshly seeded store, and the action
+gate is derived from `trade.phase`/`trade.governor` rather than described
+in prose. It is deterministic — no timestamps, no randomness, no
+floating-point formatting — so two consecutive runs are byte-identical
+and a regeneration shows up as a real diff or not at all. Alongside the
+domestic lifecycle it drives the seeded `iv-xb` interval, which `sim`
+never touches, through a complete **cross-border** trade, so the page
+shows the cross-border rule permitting a match where the basis is
+declared next to it refusing one where it is not.
 
 ## Architecture
 

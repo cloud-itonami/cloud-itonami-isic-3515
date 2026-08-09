@@ -1,0 +1,562 @@
+(ns trade.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300):
+  this repo previously had NO demo page and no generator at all.
+
+  EVERY number, id, status, permit set, fill, money leg and hold reason
+  on the generated page is produced by actually running this repo's real
+  actor stack at build time -- `trade.operation` (the langgraph-clj
+  StateGraph) -> `trade.tradeadvisor` (the contained advisor) ->
+  `trade.governor` (the independent Market Conduct Governor) ->
+  `trade.store` (the SSoT + append-only ledger) -- and then read back out
+  of the resulting store. Nothing on the page is hand-typed market data.
+  Even the action-gate table is derived from `trade.phase/write-ops`,
+  `trade.phase/phases` and `trade.governor/high-stakes` rather than
+  described by hand, so it cannot drift away from the code it documents.
+
+  The scenario is adapted from this repo's own `trade.sim` demo driver
+  (`clojure -M:dev:run`, run and read BEFORE this file was written to
+  confirm it produces a sensible ledger against the real seeded ids
+  `p-1`..`p-10` / `iv-1` / `iv-2` / `iv-eu` / `iv-xb` -- this repo's sim
+  driver does use ids that match `trade.store/demo-data`, so it was safe
+  to adapt rather than author from scratch). Two deliberate additions
+  over the sim: the seeded `iv-xb` interval -- which the sim never
+  touches -- is driven through a COMPLETE cross-border lifecycle, so the
+  page shows the cross-border rule permitting a match when the basis is
+  DECLARED right next to it holding one when it is not; and the EUR
+  prices are stated in realistic per-kWh terms.
+
+  DETERMINISTIC: no timestamps, no randomness, no floating-point
+  formatting (money is rendered from exact integer micro-units by
+  `quot`/`rem`, never through `double`, so it is neither lossy nor
+  locale-dependent). Two consecutive runs are byte-identical; verify by
+  diffing them.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [jp-go-dds.skin]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [trade.facts :as facts]
+            [trade.governor :as governor]
+            [trade.matching :as matching]
+            [trade.operation :as op]
+            [trade.phase :as phase]
+            [trade.registry :as registry]
+            [trade.store :as store]))
+
+(def ^:private operator
+  {:actor-id "op-1" :actor-role :exchange-operator :phase 3})
+
+;; 25 / 26 JPY per kWh and 0.09 / 0.095 EUR per kWh, as the integer
+;; micro-unit-per-watt-hour prices the order book actually uses.
+(def ^:private jpy-ask (registry/kwh-price->minor 25))
+(def ^:private jpy-bid (registry/kwh-price->minor 26))
+(def ^:private eur-ask (registry/kwh-price->minor 0.09))
+(def ^:private eur-bid (registry/kwh-price->minor 0.095))
+
+(defn- exec! [actor tid request]
+  (g/run* actor {:request request :context operator} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}}
+          {:thread-id tid :resume? true}))
+
+(defn- exec-approve!
+  "Run one operation and then resume it with a human exchange operator's
+  approval. Used only for ops the phase gate escalates -- an op that
+  auto-commits never pauses, and an op the governor HARD-holds never
+  reaches the approval node at all."
+  [actor tid request]
+  (exec! actor tid request)
+  (approve! actor tid))
+
+(defn run-demo!
+  "Seeds a fresh store, builds the REAL OperationActor and drives three
+  groups of operations through it.
+
+  A. A complete domestic lifecycle on the JPY book `iv-1`: register the
+     household prosumer `p-1` and the nursery school `p-2` (phase-3
+     auto-commit -- registration carries no capital risk), verify both
+     participants' JPN market-participation licence basis, screen both
+     for market abuse, `p-1` SELLs 2000 Wh at 25 JPY/kWh, `p-2` BUYs
+     2000 Wh at 26 JPY/kWh (the book crosses them at the MAKER's price),
+     both submit meter readings, and the interval is SETTLED. Every one
+     of those writes except the two registrations was escalated to a
+     human and approved -- `:actuation/place-order` and
+     `:actuation/settle-interval` can NEVER auto-commit at any phase.
+
+  B. A complete CROSS-BORDER lifecycle on `iv-xb`, the seeded EUR
+     interval that declares a `:cross-border-basis`: the Sevillian
+     co-operative `p-6` (ESP, resolving to the EU bloc entry) SELLs and
+     the Japanese prosumer `p-1` BUYs across the border, the match is
+     PERMITTED because the basis is declared, and the interval settles.
+     A second `p-6` ask is left RESTING on `iv-eu`, which declares no
+     such basis.
+
+  C. Nine distinct HARD governor holds, none of which ever reaches a
+     human: a jurisdiction with no official spec-basis (`p-3`/ATL); a
+     sale by that same unverified participant (evidence incomplete AND
+     no `:sell` right on file); a 100 W balcony generator (`p-5`)
+     offering 2000 Wh it could not physically produce in 30 minutes; an
+     unresolved market-abuse flag (`p-4`); an order into `iv-2`, whose
+     gate the seeded log has already closed; a US participant (`p-8`)
+     holding `:sell-wholesale` but not the retail `:sell` right; a
+     Korean participant (`p-9`) whose jurisdiction grants `:generate`
+     only; a EUR-denominated order into the JPY book; and a Japanese bid
+     that would cross the Spanish ask resting on `iv-eu`, which declares
+     no cross-border basis. Finally a second settlement of the
+     already-settled `iv-1`.
+
+  Returns the resulting store. Every field `render` reads below is real
+  governor/store output."
+  []
+  (let [db (store/seed-db)
+        actor (op/build db)]
+
+    ;; ---- A. domestic clean lifecycle (JPN / iv-1) ----
+    (exec! actor "p1-register"
+           {:op :participant/register :subject "p-1"
+            :patch {:id "p-1" :display-name "鈴木家 屋根置き太陽光+蓄電池"}})
+    (exec! actor "p2-register"
+           {:op :participant/register :subject "p-2"
+            :patch {:id "p-2" :display-name "さくら保育園"}})
+
+    (exec-approve! actor "p1-licence" {:op :license/verify :subject "p-1"})
+    (exec-approve! actor "p2-licence" {:op :license/verify :subject "p-2"})
+    (exec-approve! actor "p1-conduct" {:op :conduct/screen :subject "p-1"})
+    (exec-approve! actor "p2-conduct" {:op :conduct/screen :subject "p-2"})
+
+    (exec-approve! actor "iv1-ask"
+                   {:op :actuation/place-order :subject "p-1"
+                    :interval-id "iv-1" :order-id "jp-ask-1" :side :sell
+                    :qty-wh 2000 :price-minor jpy-ask :currency "JPY"})
+    (exec-approve! actor "iv1-bid"
+                   {:op :actuation/place-order :subject "p-2"
+                    :interval-id "iv-1" :order-id "jp-bid-1" :side :buy
+                    :qty-wh 2000 :price-minor jpy-bid :currency "JPY"})
+
+    (exec-approve! actor "iv1-meter-p1"
+                   {:op :meter/submit :subject "iv-1"
+                    :participant-id "p-1" :metered-wh 1950})
+    (exec-approve! actor "iv1-meter-p2"
+                   {:op :meter/submit :subject "iv-1"
+                    :participant-id "p-2" :metered-wh -2000})
+
+    (exec-approve! actor "iv1-settle"
+                   {:op :actuation/settle-interval :subject "iv-1"})
+
+    ;; ---- B. declared cross-border lifecycle (ESP -> JPN / iv-xb) ----
+    (exec-approve! actor "p6-licence" {:op :license/verify :subject "p-6"})
+    (exec-approve! actor "p6-conduct" {:op :conduct/screen :subject "p-6"})
+
+    (exec-approve! actor "ivxb-ask"
+                   {:op :actuation/place-order :subject "p-6"
+                    :interval-id "iv-xb" :order-id "xb-ask-1" :side :sell
+                    :qty-wh 2000 :price-minor eur-ask :currency "EUR"})
+    (exec-approve! actor "ivxb-bid"
+                   {:op :actuation/place-order :subject "p-1"
+                    :interval-id "iv-xb" :order-id "xb-bid-1" :side :buy
+                    :qty-wh 2000 :price-minor eur-bid :currency "EUR"})
+
+    (exec-approve! actor "ivxb-meter-p6"
+                   {:op :meter/submit :subject "iv-xb"
+                    :participant-id "p-6" :metered-wh 2000})
+    (exec-approve! actor "ivxb-meter-p1"
+                   {:op :meter/submit :subject "iv-xb"
+                    :participant-id "p-1" :metered-wh -2000})
+
+    (exec-approve! actor "ivxb-settle"
+                   {:op :actuation/settle-interval :subject "iv-xb"})
+
+    ;; a RESTING Spanish ask on the EUR book that declares no
+    ;; cross-border basis -- what the cross-border hold below crosses.
+    (exec-approve! actor "iveu-ask"
+                   {:op :actuation/place-order :subject "p-6"
+                    :interval-id "iv-eu" :order-id "eu-ask-1" :side :sell
+                    :qty-wh 2000 :price-minor eur-ask :currency "EUR"})
+
+    ;; ---- C. HARD holds: none of these ever reaches a human ----
+    (exec! actor "p3-licence"
+           {:op :license/verify :subject "p-3" :no-spec? true})
+    (exec! actor "p3-ask"
+           {:op :actuation/place-order :subject "p-3"
+            :interval-id "iv-1" :order-id "atl-ask-1" :side :sell
+            :qty-wh 1000 :price-minor jpy-ask :currency "JPY"})
+
+    (exec-approve! actor "p5-licence" {:op :license/verify :subject "p-5"})
+    (exec! actor "p5-ask"
+           {:op :actuation/place-order :subject "p-5"
+            :interval-id "iv-1" :order-id "jp-ask-2" :side :sell
+            :qty-wh 2000 :price-minor jpy-ask :currency "JPY"})
+
+    (exec! actor "p4-conduct" {:op :conduct/screen :subject "p-4"})
+
+    (exec! actor "iv2-ask"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-2" :order-id "jp-ask-3" :side :sell
+            :qty-wh 1000 :price-minor jpy-ask :currency "JPY"})
+
+    (exec-approve! actor "p8-licence" {:op :license/verify :subject "p-8"})
+    (exec! actor "p8-ask"
+           {:op :actuation/place-order :subject "p-8"
+            :interval-id "iv-1" :order-id "us-ask-1" :side :sell
+            :qty-wh 1000 :price-minor jpy-ask :currency "JPY"})
+
+    (exec-approve! actor "p9-licence" {:op :license/verify :subject "p-9"})
+    (exec! actor "p9-ask"
+           {:op :actuation/place-order :subject "p-9"
+            :interval-id "iv-1" :order-id "kr-ask-1" :side :sell
+            :qty-wh 1000 :price-minor jpy-ask :currency "JPY"})
+
+    (exec! actor "ccy-mismatch"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-1" :order-id "jp-ask-4" :side :sell
+            :qty-wh 100 :price-minor jpy-ask :currency "EUR"})
+
+    (exec! actor "xb-nobasis"
+           {:op :actuation/place-order :subject "p-1"
+            :interval-id "iv-eu" :order-id "eu-bid-1" :side :buy
+            :qty-wh 2000 :price-minor eur-bid :currency "EUR"})
+
+    (exec! actor "iv1-resettle"
+           {:op :actuation/settle-interval :subject "iv-1"})
+    db))
+
+;; ----------------------------- rendering -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- micro->display
+  "Exact integer micro currency units -> a whole-unit decimal string.
+
+  Deliberately avoids `double` and `format`: the first is lossy and the
+  second is locale-dependent, and this page must be byte-identical
+  across runs and machines. `registry/micro->units` exists for humans
+  reading a REPL; this is for a file that gets diffed."
+  [micro]
+  (let [neg? (neg? micro)
+        m (if neg? (- micro) micro)
+        whole (quot m registry/micro-per-unit)
+        frac (rem m registry/micro-per-unit)]
+    (str (when neg? "-") whole "."
+         (subs (str (+ registry/micro-per-unit frac)) 1))))
+
+(defn- price-display
+  "A book price (integer micro-units per watt-hour) shown BOTH as the
+  exact integer the engine compares on and as the per-kWh figure a human
+  quotes. `(* price wh-per-kwh)` micro-units per kWh is exact."
+  [price-minor currency]
+  (str (esc price-minor) " &micro;" (esc currency) "/Wh &middot; "
+       (micro->display (* price-minor registry/wh-per-kwh)) " "
+       (esc currency) "/kWh"))
+
+(defn- facts-for-subject [ledger subject]
+  (filter #(= (:subject %) subject) ledger))
+
+(defn- status-cell [ledger subject]
+  (let [f (last (facts-for-subject ledger subject))]
+    (cond
+      (nil? f) "<span class=\"muted\">no activity</span>"
+      (= :governor-hold (:t f))
+      (str "<span class=\"critical\">HARD hold &middot; "
+           (esc (name (or (-> f :violations first :rule) :unknown)))
+           "</span>")
+      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
+      :else "<span class=\"muted\">in progress</span>")))
+
+(defn- permits-cell [db pid]
+  (let [lic (store/licence-of db pid)
+        held (set (:permits lic))]
+    (cond
+      (nil? lic) "<span class=\"muted\">no committed licence</span>"
+      (contains? held :sell)
+      (str "<span class=\"ok\">" (esc (str/join ", " (map name (sort held))))
+           "</span> <span class=\"muted\">[" (esc (name (:resolved-at lic)))
+           "=" (esc (:resolved-key lic)) "]</span>")
+      :else
+      (str "<span class=\"warn\">"
+           (esc (if (seq held) (str/join ", " (map name (sort held))) "none"))
+           " &middot; no :sell</span> <span class=\"muted\">["
+           (esc (name (:resolved-at lic))) "=" (esc (:resolved-key lic))
+           "]</span>"))))
+
+(defn- conduct-cell [db pid]
+  (case (:verdict (store/conduct-screen-of db pid))
+    :resolved "<span class=\"ok\">resolved</span>"
+    :unresolved "<span class=\"critical\">unresolved</span>"
+    "<span class=\"muted\">not screened</span>"))
+
+(defn- participant-row
+  [db ledger {:keys [id display-name role jurisdiction subdivision capacity-w]}]
+  (format (str "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td>"
+               "<td>%s</td><td class=\"num\">%s</td><td>%s</td><td>%s</td><td>%s</td></tr>")
+          (esc id) (esc display-name) (esc (name role))
+          (esc (if subdivision (str jurisdiction "-" subdivision) jurisdiction))
+          (esc capacity-w)
+          (permits-cell db id)
+          (conduct-cell db id)
+          (status-cell ledger id)))
+
+(defn- gate-cell [{:keys [gate-closed?]}]
+  (if gate-closed?
+    "<span class=\"warn\">closed</span>"
+    "<span class=\"ok\">open</span>"))
+
+(defn- settled-cell [{:keys [settled? settlement-number]}]
+  (if settled?
+    (str "<span class=\"ok\">settled &middot; <code>" (esc settlement-number)
+         "</code></span>")
+    "<span class=\"muted\">not settled</span>"))
+
+(defn- interval-row
+  [db ledger {:keys [id starts-at-iso duration-minutes jurisdiction currency
+                     cross-border-basis]
+              :as iv}]
+  (let [{:keys [book fills]} (matching/replay-book (store/order-log db id))]
+    (format (str "        <tr><td><code>%s</code></td><td>%s</td>"
+                 "<td class=\"num\">%s min</td><td>%s</td><td>%s</td><td>%s</td>"
+                 "<td>%s</td><td class=\"num\">%s</td><td>%s</td><td>%s</td></tr>")
+            (esc id) (esc starts-at-iso) (esc duration-minutes)
+            (esc jurisdiction) (esc currency)
+            (if cross-border-basis
+              "<span class=\"ok\">declared</span>"
+              "<span class=\"muted\">none</span>")
+            (gate-cell book)
+            (esc (count fills))
+            (settled-cell iv)
+            (status-cell ledger id))))
+
+(defn- order-event-rows
+  "Every event on every interval's PUBLIC order log, in the log's own
+  total order. This is the record a third party would hold; the book
+  below is re-derived from it and from nothing else."
+  [db intervals]
+  (for [{:keys [id currency]} intervals
+        {:keys [kind seq] :as e} (store/order-log db id)]
+    (format (str "        <tr><td><code>%s</code></td><td class=\"num\">%s</td>"
+                 "<td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td>%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td></tr>")
+            (esc id) (esc seq) (esc (name kind))
+            (esc (or (:id e) "-")) (esc (or (:account e) "-"))
+            (if (:side e) (esc (name (:side e))) "-")
+            (if (:price-minor e) (price-display (:price-minor e) currency) "-")
+            (if (:qty-minor e) (str (esc (:qty-minor e)) " Wh") "-"))))
+
+(defn- fill-rows
+  "Fills INDEPENDENTLY replayed from those logs -- not read back from any
+  stored book, because this actor stores no book."
+  [db intervals]
+  (for [{:keys [id currency]} intervals
+        f (:fills (matching/replay-book (store/order-log db id)))]
+    (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td>%s</td><td class=\"num\">%s Wh</td><td class=\"amt\">%s %s</td></tr>")
+            (esc id) (esc (:maker-id f)) (esc (:taker-id f))
+            (esc (:seller f)) (esc (:buyer f))
+            (price-display (:price-minor f) currency)
+            (esc (:qty-minor f))
+            (micro->display (matching/fill-money-micro f))
+            (esc currency))))
+
+(defn- hold-rows
+  "One row per HARD violation actually recorded on the ledger. The rule
+  name and the Japanese detail string are the governor's own words,
+  copied out of the stored fact."
+  [ledger]
+  (for [{:keys [op subject violations]} (filter #(= :governor-hold (:t %)) ledger)
+        v violations]
+    ;; `str` on the op, not `name`: this actor has :license/verify,
+    ;; :conduct/screen and :meter/submit, whose bare names ("verify",
+    ;; "screen", "submit") do not say which op they were.
+    (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td>"
+                 "<td><span class=\"critical\">%s</span></td><td>%s</td></tr>")
+            (esc (str op)) (esc subject)
+            (esc (name (:rule v))) (esc (:detail v)))))
+
+(defn- gate-rows
+  "The action gate, DERIVED from `trade.phase` and `trade.governor`
+  rather than described by hand -- if someone ever added an actuation to
+  a phase's `:auto` set, this table would say so instead of continuing
+  to claim otherwise."
+  []
+  (let [{:keys [writes auto]} (get phase/phases phase/default-phase)]
+    (for [o (sort-by str phase/write-ops)]
+      (format "        <tr><td><code>%s</code></td><td>%s</td></tr>"
+              (esc (str o))
+              (cond
+                (contains? governor/high-stakes o)
+                "<span class=\"warn\">ALWAYS human approval &middot; never auto at ANY phase &middot; governor high-stakes</span>"
+                (contains? auto o)
+                "<span class=\"ok\">phase-3 auto-commit when governor-clean</span>"
+                (contains? writes o)
+                "<span class=\"warn\">phase-3: human approval (not auto-eligible)</span>"
+                :else
+                "<span class=\"muted\">not writable at phase 3</span>")))))
+
+(defn- ledger-row [{:keys [t op subject disposition basis]}]
+  (format (str "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td>"
+               "<td>%s</td></tr>")
+          (esc (name t)) (esc (str op)) (esc subject)
+          (esc (or (some->> basis (map #(if (keyword? %) (name %) (str %)))
+                            (str/join ", "))
+                   (some-> disposition name)
+                   ""))))
+
+(defn- order-record-row [r]
+  (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td>"
+               "<td><code>%s</code></td><td>%s</td><td>%s</td><td class=\"num\">%s Wh</td>"
+               "<td>%s</td></tr>")
+          (esc (get r "record_id")) (esc (get r "participant_id"))
+          (esc (get r "interval_id")) (esc (get r "jurisdiction"))
+          (esc (get r "side")) (esc (get r "qty_wh"))
+          (price-display (get r "price_micro_per_wh") (get r "currency"))))
+
+(defn- settlement-position-rows
+  "The settlement record itself carries no currency -- a settlement is
+  scoped to one interval and the interval's book is single-currency by
+  construction -- so the unit is read back off that interval rather than
+  assumed."
+  [db r]
+  (let [ccy (:currency (store/interval db (get r "interval_id")))]
+    (for [p (get r "positions")]
+      (format (str "        <tr><td><code>%s</code></td><td><code>%s</code></td>"
+                   "<td class=\"num\">%s Wh</td><td class=\"num\">%s Wh</td>"
+                   "<td class=\"num\">%s Wh</td><td class=\"amt\">%s %s</td></tr>")
+              (esc (get r "record_id")) (esc (get p "participant_id"))
+              (esc (get p "contracted_wh")) (esc (get p "metered_wh"))
+              (esc (get p "imbalance_wh"))
+              (micro->display (get p "money_micro")) (esc ccy)))))
+
+(defn- section [title lead headers body-rows]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" title "</h2>\n"
+       "    <p class=\"muted\">" lead "</p>\n"
+       "    <table>\n"
+       "      <thead><tr>"
+       (str/join (map #(str "<th>" % "</th>") headers))
+       "</tr></thead>\n"
+       "      <tbody>\n"
+       (str/join "\n" body-rows) "\n"
+       "      </tbody>\n"
+       "    </table>\n"
+       "  </section>\n"))
+
+(defn render
+  "Renders the full operator-console.html document from a store `db` that
+  has already run `run-demo!` (or any other real scenario)."
+  [db]
+  (let [ledger (vec (store/ledger db))
+        participants (sort-by (fn [{:keys [id]}]
+                                ;; display order only: "p-10" after "p-9"
+                                (parse-long (subs id 2)))
+                              (store/all-participants db))
+        intervals (store/all-intervals db)
+        cov (facts/coverage)]
+    (str
+     "<html><head><meta charset=\"utf-8\">"
+     "<title>cloud-itonami-isic-3515 &middot; electric power trade</title><style>"
+     (jp-go-dds.skin/dds+skin)
+     "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Trade of electricity (ISIC 3515) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · order placement and interval settlement are ALWAYS human-approved</span>\n"
+     "</header>\n"
+     "<main>\n"
+     "  <section class=\"card\">\n"
+     "    <p class=\"muted\">Build-time snapshot generated by <code>trade.render-html</code> (<code>clojure -M:dev:render-html</code>) by actually running this repo's <code>trade.operation</code> actor — the langgraph-clj StateGraph, the Market Conduct Governor and the append-only ledger — over a freshly seeded <code>trade.store</code>. Every id, quantity, price, money leg and hold reason below was read back out of that run. There is no hand-written market data on this page.</p>\n"
+     "  </section>\n"
+
+     (section
+      "Participants"
+      "Registration is open to anyone in any role. What a registration entitles you to do is decided afterwards, by the committed licence basis — never by a gate on the door. A participant with no <code>:sell</code> right on file cannot sell, and no human approver can override that."
+      ["Participant" "Name" "Role" "Jurisdiction" "Capacity (W)"
+       "Committed permits" "Conduct screening" "Last op status"]
+      (map (partial participant-row db ledger) participants))
+
+     (section
+      "Delivery intervals"
+      "A book is single-currency by construction. Gate state is not a mutable flag — it is an event in the interval's own order log, so an interval whose gate is closed is one whose public log says so. A cross-border match is permitted only where the interval DECLARES a basis; <code>iv-xb</code> does and <code>iv-eu</code> does not."
+      ["Interval" "Starts (UTC)" "Duration" "Jurisdiction" "Currency"
+       "Cross-border basis" "Gate" "Fills" "Settlement" "Last op status"]
+      (map (partial interval-row db ledger) intervals))
+
+     (section
+      "Public order log"
+      "The market's ONLY source of truth. This actor persists no materialised order book; every reader — the governor, the settlement computation, an outside auditor — re-derives the book from this log with <code>trade.matching/replay-book</code>. There is therefore no cached book that could silently disagree with it."
+      ["Interval" "Seq" "Event" "Order" "Account" "Side" "Price" "Quantity"]
+      (order-event-rows db intervals))
+
+     (section
+      "Fills, independently replayed"
+      "Re-derived from the log above and from nothing else. A crossing order fills at the MAKER's price — the taker never sets it — and each money leg is exact integer multiplication of quantity by price in micro units, with no rounding anywhere."
+      ["Interval" "Maker" "Taker" "Seller" "Buyer" "Fill price" "Quantity" "Money"]
+      (fill-rows db intervals))
+
+     (section
+      "HARD governor holds (this run)"
+      "None of these ever reached a human. A HARD violation is not a warning an approver may click past: the actor routes it straight to <code>:hold</code>, writes the refusal to the ledger, and mutates nothing. The detail text is the Market Conduct Governor's own, copied out of the stored fact."
+      ["Op" "Subject" "Rule" "Governor detail"]
+      (hold-rows ledger))
+
+     (section
+      "Action gate"
+      "Derived at build time from <code>trade.phase/write-ops</code>, <code>trade.phase/phases</code> and <code>trade.governor/high-stakes</code> — not described by hand, so it cannot drift away from the code. Note that the two actuations are absent from every phase's <code>:auto</code> set including phase 3, and that the governor enforces the same invariant independently. Two layers agree, and neither is sufficient alone."
+      ["Op" "Gate"]
+      (gate-rows))
+
+     (section
+      "Audit ledger (this run)"
+      "The append-only decision-fact log. Every commit and every hold this scenario produced, in order."
+      ["Fact" "Op" "Subject" "Basis"]
+      (map ledger-row ledger))
+
+     (section
+      "Draft order records"
+      "Unsigned drafts. This actor builds the record an exchange operator would keep; it does not place an order on any real exchange, and signature is the operator's own act."
+      ["Record" "Participant" "Interval" "Jurisdiction" "Side" "Quantity" "Price"]
+      (map order-record-row (store/order-history db)))
+
+     (section
+      "Draft settlement positions"
+      "Contracted volume reconciled against METERED actual delivery. A negative imbalance means the participant delivered LESS than it sold. A position with no meter reading cannot be represented at all — <code>trade.registry/register-settlement</code> refuses to build the record, and the governor holds before it ever gets there."
+      ["Record" "Participant" "Contracted" "Metered" "Imbalance" "Money"]
+      (mapcat (partial settlement-position-rows db) (store/settlement-history db)))
+
+     "  <section class=\"card\">\n"
+     "    <h2>Jurisdiction coverage, reported honestly</h2>\n"
+     "    <p><span class=\"num\">" (esc (count (:covered-directly cov)))
+     "</span> jurisdictions have their own fetched-and-read entry ("
+     (esc (str/join ", " (:covered-directly cov)))
+     "); <span class=\"num\">" (esc (count (:covered-via-bloc cov)))
+     "</span> more resolve to the EU bloc entry; <span class=\"num\">"
+     (esc (count (:missing-jurisdictions cov)))
+     "</span> have no basis at any level.</p>\n"
+     "    <p>Jurisdictions with an entry that does NOT grant the retail <code>:sell</code> right: <code>"
+     (esc (str/join ", " (facts/jurisdictions-without-sell-right)))
+     "</code>. Reported explicitly so nobody has to discover by trial that a peer-to-peer retail sale is unavailable there.</p>\n"
+     "    <p class=\"muted\">" (esc (:note cov)) "</p>\n"
+     "  </section>\n"
+     "</main>\n"
+     "<footer>Generated by <code>trade.render-html</code> from a real "
+     "<code>trade.operation</code> actor run. Deterministic: no timestamps, "
+     "no randomness, no floating-point formatting — two consecutive runs are "
+     "byte-identical.</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        db (run-demo!)
+        ledger (store/ledger db)
+        html (render db)]
+    (spit out html)
+    (println "wrote" out
+             (str "(" (count ledger) " ledger facts, "
+                  (count (filter #(= :governor-hold (:t %)) ledger)) " HARD holds, "
+                  (count (store/order-history db)) " order records, "
+                  (count (store/settlement-history db)) " settlement records)"))))
