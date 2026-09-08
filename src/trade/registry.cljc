@@ -23,7 +23,7 @@
   where physics constrains the market, and both are deliberately pure
   so `trade.governor` can recompute them from ground-truth fields
   without trusting any proposal, verdict or stored opinion."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; ----------------------------- units -----------------------------
 
@@ -164,7 +164,7 @@
     (throw (ex-info "order: price_minor must be a positive integer" {:price price-minor})))
   (when (< sequence 0)
     (throw (ex-info "order: sequence must be >= 0" {})))
-  (let [order-number (str (str/upper-case jurisdiction) "-ORD-" (zero-pad sequence 6))
+  (let [order-number (str (str/upper jurisdiction) "-ORD-" (zero-pad sequence 6))
         record {"record_id" order-number
                 "kind" "order-placement-draft"
                 "participant_id" participant-id
@@ -204,7 +204,7 @@
     (throw (ex-info "settlement: every position must carry a metered reading"
                     {:unmetered (mapv :participant-id
                                       (filter #(nil? (:metered-wh %)) positions))})))
-  (let [settlement-number (str (str/upper-case jurisdiction) "-STL-" (zero-pad sequence 6))
+  (let [settlement-number (str (str/upper jurisdiction) "-STL-" (zero-pad sequence 6))
         record {"record_id" settlement-number
                 "kind" "interval-settlement-draft"
                 "interval_id" interval-id
