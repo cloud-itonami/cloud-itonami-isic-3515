@@ -107,7 +107,7 @@ on every fill and a rounding policy that would itself need governing.
 `:actuation/place-order` and `:actuation/settle-interval` never
 auto-commit, at any phase, including phase 3. Enforced twice
 independently: absent from every `:auto` set in `trade.phase`, and in
-`trade.governor/high-stakes`. `test/trade/phase_test.clj` asserts it
+`trade.governor/high-stakes`. `test/trade/phase_test.cljk` asserts it
 across the whole phase table.
 
 An order book a model may fill on its own initiative is a machine for

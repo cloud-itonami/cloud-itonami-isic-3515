@@ -12,7 +12,7 @@
                         `langchain.db`'s `:db-api`.
 
   Both implement the same protocol and pass the same contract
-  (test/trade/store_contract_test.clj), which is the whole point: the
+  (test/trade/store_contract_test.cljk), which is the whole point: the
   actor, the Market Conduct Governor and the audit ledger never know
   which SSoT they run on.
 
