@@ -1,5 +1,5 @@
 (ns trade.sim
-  "Demo driver -- `clojure -M:dev:run`. Walks a complete peer-to-peer
+  "Demo driver -- `kbb -M:dev:run`. Walks a complete peer-to-peer
   electricity trade end to end:
 
     register a household prosumer and a nursery school

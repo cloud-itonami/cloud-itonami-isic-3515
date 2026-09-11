@@ -22,7 +22,7 @@ actor in this fleet. Here it is **Electricity Trade Advisor ⊣ Market
 Conduct Governor**.
 
 **Maturity: `:implemented`.** 73 tests / 568 assertions pass; `clj-kondo`
-reports 0 errors and 0 warnings; `clojure -M:dev:run` walks a complete
+reports 0 errors and 0 warnings; `kbb -M:dev:run` walks a complete
 trade end to end and then exercises five distinct regulatory shapes on
 four continents. See **Maturity, honestly** below for what
 `:implemented` does and does not claim.
@@ -289,10 +289,10 @@ money.
 ## Run it
 
 ```bash
-clojure -M:dev:test         # 73 tests, 568 assertions
-clojure -M:lint             # clj-kondo, errors fail CI
-clojure -M:dev:run          # a complete trade, then every HARD hold
-clojure -M:dev:render-html  # regenerate docs/samples/operator-console.html
+kbb -M:dev:test         # 73 tests, 568 assertions
+kbb -M:lint             # clj-kondo, errors fail CI
+kbb -M:dev:run          # a complete trade, then every HARD hold
+kbb -M:dev:render-html  # regenerate docs/samples/operator-console.html
 ```
 
 The demo registers a household prosumer and a nursery school, licenses

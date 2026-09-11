@@ -273,9 +273,9 @@ added dimensions to the *facts* and two boundary checks to the
 
 ## Verification
 
-`clojure -M:dev:test` — 73 tests, **568 assertions, 0 failures, 0
-errors**. `clojure -M:lint` — **0 errors, 0 warnings**.
-`clojure -M:dev:run` walks a complete trade (2000 Wh at the maker's
+`kbb -M:dev:test` — 73 tests, **568 assertions, 0 failures, 0
+errors**. `kbb -M:lint` — **0 errors, 0 warnings**.
+`kbb -M:dev:run` walks a complete trade (2000 Wh at the maker's
 25 JPY/kWh = 50.00 JPY exactly, seller 50 Wh short at the meter) and then
 every HARD hold.
 
