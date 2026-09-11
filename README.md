@@ -115,7 +115,7 @@ any phase**:
 Both are permanently absent from every phase's `:auto` set in
 `trade.phase`, *including* phase 3, and `trade.governor`'s high-stakes
 gate escalates them independently. Two layers agree, and neither is
-sufficient alone. `test/trade/phase_test.clj` asserts this across the
+sufficient alone. `test/trade/phase_test.cljk` asserts this across the
 whole phase table rather than trusting the prose.
 
 The reason is specific to this domain: **an order book that a language
