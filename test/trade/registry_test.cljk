@@ -1,5 +1,5 @@
 (ns trade.registry-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [trade.registry :as r]))
 
 (deftest price-conversion-round-trips

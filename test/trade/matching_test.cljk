@@ -4,7 +4,7 @@
   These are the properties an outside auditor relies on: same log in,
   same fills out; a taker never pays worse than it asked; a participant
   cannot trade with itself; and a closed gate cannot be traded through."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [trade.matching :as m]))
 
 (defn- order [seq id account side price qty]

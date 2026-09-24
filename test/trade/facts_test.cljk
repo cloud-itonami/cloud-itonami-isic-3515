@@ -3,7 +3,7 @@
   MANY jurisdictions are seeded -- they are about the catalog never
   granting a right it cannot cite, and never letting a coverage gap look
   like a permission."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [trade.facts :as facts]))
 
 (defn- national-keys []

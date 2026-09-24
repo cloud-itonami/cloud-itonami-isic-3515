@@ -1,5 +1,5 @@
 (ns trade.phase-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [trade.phase :as phase]))
 
 (def ^:private actuations #{:actuation/place-order :actuation/settle-interval})
