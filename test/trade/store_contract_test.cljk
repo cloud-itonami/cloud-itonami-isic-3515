@@ -8,7 +8,7 @@
   backends must return the same events in the same interval-scoped
   order, because the book is re-derived from that order and a backend
   that reordered it would produce different fills from the same trades."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [trade.matching :as matching]
             [trade.store :as store]))
 

@@ -4,7 +4,7 @@
   against the governor in isolation. What matters is not that
   `governor/check` returns a map, but that a bad proposal cannot reach
   the SSoT no matter who approves it."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [trade.governor :as governor]
             [trade.matching :as matching]
